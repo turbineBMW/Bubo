@@ -3,6 +3,7 @@ use super::state::{Conv, Media, Msg, fmt_time};
 use crate::gm::client::Client;
 use crate::gm::events::Event;
 use crate::gm::proto::client::list_conversations_request::Folder;
+use crate::gm::proto::client::GetThumbnailResponse;
 use adw::prelude::*;
 use gtk4::glib;
 use std::cell::{Cell, RefCell};
@@ -77,7 +78,12 @@ struct ContactEntry {
     /// Pretty form for display, falling back to `number`.
     formatted: String,
     participant_id: String,
+    contact_id: String,
 }
+
+/// Cache key for an address-book photo. Contact ids live in a different namespace from
+/// participant ids, so prefix them to keep the two apart in the avatar cache.
+fn contact_key(contact_id: &str) -> String { format!("contact:{contact_id}") }
 
 /// Keep only what a dialler would: a leading `+` and digits. `None` if the text doesn't look
 /// like a phone number at all (letters, or fewer than three digits).
@@ -291,13 +297,14 @@ impl ChatsView {
     fn fetch_avatars(self: &Rc<Self>) {
         let ids: Vec<String> = self.st.borrow().convs.iter().flat_map(|c| c.participant_ids.iter().cloned()).collect();
         let me = Rc::downgrade(self);
-        self.request_avatars(ids, move || { if let Some(me) = me.upgrade() { me.refresh_avatars_in_place(); } });
+        self.request_avatars(ids, false, move || { if let Some(me) = me.upgrade() { me.refresh_avatars_in_place(); } });
     }
 
     /// Resolve photos for `ids` — from the on-disk cache where possible, otherwise from the phone
     /// in batched RPCs — and call `on_done` once anything new is available. Ids already cached or
-    /// in flight are skipped, so calling this repeatedly is cheap.
-    fn request_avatars(self: &Rc<Self>, ids: Vec<String>, on_done: impl Fn() + 'static) {
+    /// in flight are skipped, so calling this repeatedly is cheap. With `contacts` set, `ids` are
+    /// `contact_key`s and the address-book thumbnail RPC is used instead of the participant one.
+    fn request_avatars(self: &Rc<Self>, ids: Vec<String>, contacts: bool, on_done: impl Fn() + 'static) {
         let mut wanted: Vec<String> = Vec::new();
         {
             let mut cache = self.avatars.borrow_mut();
@@ -320,7 +327,11 @@ impl ChatsView {
         crate::rt::spawn(async move {
             let mut out = Vec::new();
             for chunk in wanted.chunks(40) {
-                match c.participant_thumbnails(chunk).await {
+                let r = if contacts {
+                    let raw: Vec<String> = chunk.iter().map(|k| k.trim_start_matches("contact:").to_string()).collect();
+                    c.contact_thumbnails(&raw).await.map(|r| GetThumbnailResponse { thumbnail: r.thumbnail.into_iter().map(|mut t| { t.identifier = contact_key(&t.identifier); t }).collect() })
+                } else { c.participant_thumbnails(chunk).await };
+                match r {
                     Ok(r) => out.extend(r.thumbnail.into_iter().map(|t| (t.identifier, t.data.map(|d| d.image_buffer).unwrap_or_default()))),
                     Err(e) => tracing::warn!("participant thumbnails: {e:#}"),
                 }
@@ -653,9 +664,10 @@ impl ChatsView {
                 if !hit { continue; }
                 let row = adw::ActionRow::builder().title(glib::markup_escape_text(&c.name)).subtitle(glib::markup_escape_text(&c.formatted)).activatable(true).build();
                 let av = adw::Avatar::new(32, Some(&c.name), true);
-                if let Some(Some(tex)) = avatars.get(&c.participant_id) { av.set_custom_image(Some(tex)); }
+                let key = contact_key(&c.contact_id);
+                if let Some(Some(tex)) = avatars.get(&key).or_else(|| avatars.get(&c.participant_id)) { av.set_custom_image(Some(tex)); }
                 row.add_prefix(&av);
-                unsafe { row.set_data("number", c.number.clone()); row.set_data("pid", c.participant_id.clone()); }
+                unsafe { row.set_data("number", c.number.clone()); if !c.contact_id.is_empty() { row.set_data("pid", key); } }
                 list2.append(&row); n += 1;
             }
             pages2.set_visible_child_name(if n == 0 { "empty" } else { "list" });
@@ -688,7 +700,7 @@ impl ChatsView {
                 if let Some(pid) = unsafe { row.data::<String>("pid").map(|p| p.as_ref().clone()) } { ids.push(pid); }
             }
             let p = p.clone();
-            me.request_avatars(ids, move || p());
+            me.request_avatars(ids, true, move || p());
         });
 
         let f = fill.clone();
@@ -718,7 +730,7 @@ impl ChatsView {
                             if number.is_empty() { return None; }
                             let formatted = n.formatted_number.filter(|f| !f.is_empty()).unwrap_or_else(|| number.clone());
                             let name = if c.name.is_empty() { formatted.clone() } else { c.name };
-                            Some(ContactEntry { name, number, formatted, participant_id: c.participant_id })
+                            Some(ContactEntry { name, number, formatted, participant_id: c.participant_id, contact_id: c.contact_id })
                         }).collect();
                         v.sort_by_key(|c| c.name.to_lowercase());
                         *me.contacts.borrow_mut() = Some(Rc::new(v));

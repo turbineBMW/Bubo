@@ -510,6 +510,11 @@ impl Client {
     pub async fn participant_thumbnails(&self, ids: &[String]) -> Result<GetThumbnailResponse> {
         self.call(ActionType::GetParticipantsThumbnail, GetThumbnailRequest { identifiers: ids.to_vec() }, false).await
     }
+    /// Photos for address-book entries, keyed by `Contact.contact_id` (a different namespace
+    /// from participant ids — the phone answers the two from different tables).
+    pub async fn contact_thumbnails(&self, contact_ids: &[String]) -> Result<GetThumbnailResponse> {
+        self.call(ActionType::GetContactsThumbnail, GetThumbnailRequest { identifiers: contact_ids.to_vec() }, false).await
+    }
     pub async fn list_contacts(&self) -> Result<ListContactsResponse> {
         self.call(ActionType::ListContacts, ListContactsRequest { i1: 1, i2: 350, i3: 50 }, false).await
     }
