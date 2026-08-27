@@ -27,6 +27,8 @@ pub struct ChatsView {
     list: gtk4::ListBox,
     thread: gtk4::ListBox,
     thread_scroll: gtk4::ScrolledWindow,
+    /// Full-resolution media bytes keyed by attachment id, so re-rendering a thread never refetches.
+    media_cache: Rc<RefCell<HashMap<String, Rc<Vec<u8>>>>>,
     thread_title: adw::WindowTitle,
     entry: gtk4::Entry,
     send: gtk4::Button,
@@ -107,7 +109,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer };
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, media_cache: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -405,6 +407,49 @@ impl ChatsView {
     gtk4::ListBoxRow::builder().child(&col).activatable(false).selectable(false).build()
     }
 
+    /// Fetch the full-resolution image the first time `pic` is within one viewport-height of the
+    /// visible area of the thread scroller; then replace the placeholder with it.
+    fn lazy_load_image(self: &Rc<Self>, holder: &gtk4::Box, pic: &gtk4::Picture, att_id: String, key: Vec<u8>) {
+        let sw = self.thread_scroll.clone();
+        let fired = Rc::new(std::cell::Cell::new(false));
+        let (me, holder, pic0) = (self.clone(), holder.clone(), pic.clone());
+        let check: Rc<dyn Fn()> = Rc::new(move || {
+            let pic = &pic0;
+            if fired.get() || !pic.is_mapped() { return; }
+            let Some(b) = pic.compute_bounds(&sw) else { return };
+            let vh = sw.height() as f32;
+            if b.y() > vh * 2.0 || b.y() + b.height() < -vh { return; }
+            fired.set(true);
+            let (tx, rx) = async_channel::bounded(1);
+            let (c, id, key) = (me.client.clone(), att_id.clone(), key.clone());
+            crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
+            let (me, holder, pic, id) = (me.clone(), holder.clone(), pic.clone(), att_id.clone());
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(bytes)) => {
+                        let bytes = Rc::new(bytes);
+                        me.media_cache.borrow_mut().insert(id, bytes.clone());
+                        match Self::image_picture(&bytes) {
+                            Ok(full) => { if pic.parent().is_some() { holder.remove(&pic); holder.append(&full); } }
+                            Err(e) => tracing::warn!("could not decode image: {e}"),
+                        }
+                    }
+                    Ok(Err(e)) => tracing::warn!("image download failed: {e:#}"),
+                    Err(_) => {}
+                }
+            });
+        });
+        // Re-check on map, on scroll, and whenever the scroller is resized.
+        let c = check.clone(); pic.connect_map(move |_| c());
+        let c = check.clone(); let weak = pic.downgrade();
+        let id = self.thread_scroll.vadjustment().connect_value_changed(move |_| { if weak.upgrade().is_some() { c(); } });
+        let adj = self.thread_scroll.vadjustment();
+        let handler = Rc::new(RefCell::new(Some(id)));
+        pic.connect_unrealize(move |_| { if let Some(id) = handler.borrow_mut().take() { adj.disconnect(id); } });
+        // The scroller lays out after map; poll once shortly after so the initial screen fills in.
+        let c = check.clone(); glib::timeout_add_local_once(std::time::Duration::from_millis(50), move || c());
+    }
+
     /// Bare image, scaled to fit within 360x480 (small thumbnails are scaled up), rounded corners.
     /// GIFs animate: frames are pulled from a PixbufAnimation on a timer for as long as the widget lives.
     fn image_picture(bytes: &[u8]) -> anyhow::Result<gtk4::Picture> {
@@ -457,29 +502,14 @@ impl ChatsView {
             if md.is_image() {
                 if let Ok(pic) = Self::image_picture(&md.inline) {
                     holder.append(&pic);
-                    // Inline bytes are usually a low-res preview: a click fetches the full image.
+                    // Inline bytes are a low-res preview. Show it immediately as a placeholder and
+                    // swap in the full image once the widget scrolls into (or near) the viewport.
                     if let Some((att_id, key)) = md.source() {
-                        let click = gtk4::GestureClick::new();
-                        let (me, holder2, pic2, busy) = (self.clone(), holder.clone(), pic.clone(), Rc::new(std::cell::Cell::new(false)));
-                        click.connect_released(move |_, _, _, _| {
-                            if busy.replace(true) { return; }
-                            let (tx, rx) = async_channel::bounded(1);
-                            let (c, id, key) = (me.client.clone(), att_id.clone(), key.clone());
-                            crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
-                            let (me, holder2, pic2, busy) = (me.clone(), holder2.clone(), pic2.clone(), busy.clone());
-                            glib::spawn_future_local(async move {
-                                match rx.recv().await {
-                                    Ok(Ok(bytes)) => match Self::image_picture(&bytes) {
-                                        Ok(pic) => { holder2.remove(&pic2); holder2.append(&pic); }
-                                        Err(e) => { busy.set(false); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
-                                    },
-                                    Ok(Err(e)) => { busy.set(false); me.toast.add_toast(adw::Toast::new(&format!("Download failed: {e:#}"))); }
-                                    Err(_) => busy.set(false),
-                                }
-                            });
-                        });
-                        pic.add_controller(click);
-                        pic.set_cursor_from_name(Some("pointer"));
+                        if let Some(bytes) = self.media_cache.borrow().get(&att_id).cloned() {
+                            if let Ok(full) = Self::image_picture(&bytes) { holder.remove(&pic); holder.append(&full); }
+                            return holder.upcast();
+                        }
+                        self.lazy_load_image(&holder, &pic, att_id, key);
                     }
                     return holder.upcast();
                 }
