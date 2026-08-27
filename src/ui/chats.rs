@@ -33,6 +33,26 @@ pub struct ChatsView {
     attach: gtk4::Button,
     toast: adw::ToastOverlay,
     banner: adw::Banner,
+    side_stack: gtk4::Stack,
+    content_stack: gtk4::Stack,
+    composer: gtk4::Box,
+}
+
+/// A centred spinner with a caption, used while a pane is waiting on the phone.
+fn loading_page(text: &str) -> gtk4::Widget {
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(32, 32);
+    let label = gtk4::Label::builder().label(text).css_classes(["dim-label"]).build();
+    let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(12).halign(gtk4::Align::Center).valign(gtk4::Align::Center).vexpand(true).hexpand(true).build();
+    col.append(&spinner); col.append(&label);
+    col.upcast()
+}
+
+/// Build a stack of named pages, crossfading between them.
+fn stack(pages: &[(&str, &gtk4::Widget)]) -> gtk4::Stack {
+    let st = gtk4::Stack::builder().transition_type(gtk4::StackTransitionType::Crossfade).transition_duration(150).vexpand(true).build();
+    for (name, w) in pages { st.add_named(*w, Some(name)); }
+    st
 }
 
 impl ChatsView {
@@ -44,9 +64,11 @@ impl ChatsView {
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("Unpair phone"), Some("app.unpair"));
         side_header.pack_end(&gtk4::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build());
+        let side_empty = adw::StatusPage::builder().icon_name("chat-message-new-symbolic").title("No conversations").description("Messages from your phone will show up here.").build();
+        let side_stack = stack(&[("loading", &loading_page("Loading conversations…")), ("empty", side_empty.upcast_ref()), ("list", side_scroll.upcast_ref())]);
         let side = adw::ToolbarView::new();
         side.add_top_bar(&side_header);
-        side.set_content(Some(&side_scroll));
+        side.set_content(Some(&side_stack));
         let sidebar = adw::NavigationPage::builder().title("Chats").child(&side).build();
 
         // ── thread ──
@@ -59,9 +81,12 @@ impl ChatsView {
         let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").build();
         let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).build();
         composer.append(&attach); composer.append(&entry); composer.append(&send);
+        composer.set_visible(false);
         let banner = adw::Banner::builder().revealed(false).build();
+        let content_empty = adw::StatusPage::builder().icon_name("user-available-symbolic").title("Select a conversation").description("Pick a chat from the list to start messaging.").build();
+        let content_stack = stack(&[("empty", content_empty.upcast_ref()), ("loading", &loading_page("Loading messages…")), ("thread", thread_scroll.upcast_ref())]);
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        content_box.append(&banner); content_box.append(&thread_scroll); content_box.append(&composer);
+        content_box.append(&banner); content_box.append(&content_stack); content_box.append(&composer);
         let content = adw::ToolbarView::new();
         content.add_top_bar(&adw::HeaderBar::builder().title_widget(&thread_title).build());
         content.set_content(Some(&content_box));
@@ -81,7 +106,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, attach, toast, banner };
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -141,7 +166,7 @@ impl ChatsView {
         glib::spawn_future_local(async move {
             match rx.recv().await {
                 Ok(Ok(r)) => { for c in &r.conversations { me.upsert_conv(Conv::from_proto(c)); } me.rebuild_list(); }
-                Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Could not load chats: {e:#}"))),
+                Ok(Err(e)) => { me.rebuild_list(); me.toast.add_toast(adw::Toast::new(&format!("Could not load chats: {e:#}"))); }
                 Err(_) => {}
             }
         });
@@ -184,6 +209,7 @@ impl ChatsView {
             rows.insert(c.id.clone(), row);
         }
         self.st.borrow_mut().rows = rows;
+        self.side_stack.set_visible_child_name(if convs.is_empty() { "empty" } else { "list" });
     }
 
     fn open(self: &Rc<Self>, id: &str) {
@@ -193,9 +219,12 @@ impl ChatsView {
         self.thread_title.set_title(&conv.name);
         self.thread_title.set_subtitle(if conv.is_rcs { "RCS" } else { "SMS/MMS" });
         self.widget.set_show_content(true);
+        self.composer.set_visible(true);
         self.entry.grab_focus();
-        self.render_thread();
-        if !self.st.borrow().messages.contains_key(id) {
+        let loaded = self.st.borrow().messages.contains_key(id);
+        if loaded { self.render_thread(); } else {
+            while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
+            self.content_stack.set_visible_child_name("loading");
             let c = self.client.clone(); let id2 = id.to_string();
             let (tx, rx) = async_channel::bounded(1);
             crate::rt::spawn(async move { let _ = tx.send(c.list_messages(&id2, 50, None).await).await; });
@@ -208,7 +237,10 @@ impl ChatsView {
                         me.st.borrow_mut().messages.insert(id2.clone(), msgs);
                         if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(); }
                     }
-                    Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Could not load messages: {e:#}"))),
+                    Ok(Err(e)) => {
+                        if me.st.borrow().current.as_deref() == Some(&id2) { me.content_stack.set_visible_child_name("thread"); }
+                        me.toast.add_toast(adw::Toast::new(&format!("Could not load messages: {e:#}")));
+                    }
                     Err(_) => {}
                 }
             });
@@ -237,6 +269,7 @@ impl ChatsView {
         let st = self.st.borrow();
         let Some(cur) = &st.current else { return };
         let Some(msgs) = st.messages.get(cur) else { return };
+        self.content_stack.set_visible_child_name("thread");
         let group = st.convs.iter().find(|c| &c.id == cur).map(|c| c.is_group).unwrap_or(false);
         for m in msgs { self.thread.append(&self.bubble(m, group)); }
         drop(st);
