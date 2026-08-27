@@ -67,8 +67,15 @@ pub struct Conv {
     pub id: String,
     pub name: String,
     pub snippet: String,
+    /// Whether the latest message was sent by us (drives the "You: " prefix in the list).
+    pub last_from_me: bool,
+    /// Display name of the latest message's sender, when the phone provides one (group chats).
+    pub last_sender: String,
     pub ts: i64,
     pub unread: bool,
+    /// Incoming messages seen since the conversation was last opened. Tracked locally — the
+    /// phone only reports a boolean — so it starts at 0 for conversations already unread at launch.
+    pub unread_count: u32,
     pub is_group: bool,
     pub default_outgoing_id: String,
     pub latest_message_id: String,
@@ -81,7 +88,9 @@ impl Conv {
         Self {
             id: c.conversation_id.clone(), name: c.name.clone(),
             snippet: lm.map(|m| m.display_content.clone()).unwrap_or_default(),
-            ts: c.last_message_timestamp, unread: c.unread, is_group: c.is_group_chat,
+            last_from_me: lm.map(|m| m.from_me != 0).unwrap_or(false),
+            last_sender: lm.map(|m| m.display_name.clone()).unwrap_or_default(),
+            ts: c.last_message_timestamp, unread: c.unread, unread_count: 0, is_group: c.is_group_chat,
             default_outgoing_id: c.default_outgoing_id.clone(), latest_message_id: c.latest_message_id.clone(),
             is_rcs: c.r#type == 2,
         }

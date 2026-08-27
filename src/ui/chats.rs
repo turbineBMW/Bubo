@@ -66,7 +66,7 @@ fn stack(pages: &[(&str, &gtk4::Widget)]) -> gtk4::Stack {
 impl ChatsView {
     pub fn new(win: &adw::ApplicationWindow, client: Arc<Client>, events: async_channel::Receiver<Event>) -> Self {
         // ── sidebar ──
-        let list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::Single).css_classes(["navigation-sidebar"]).build();
+        let list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::Single).css_classes(["navigation-sidebar", "bubo-convs"]).build();
         let side_scroll = gtk4::ScrolledWindow::builder().child(&list).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
         let side_header = adw::HeaderBar::builder().title_widget(&adw::WindowTitle::new("Bubo", "")).build();
         let menu = gtk4::gio::Menu::new();
@@ -106,12 +106,17 @@ impl ChatsView {
         let css = gtk4::CssProvider::new();
         css.load_from_string("
             .bubo-bubble { padding: 8px 12px; border-radius: 16px; }
-            .bubo-me { background: @accent_bg_color; color: @accent_fg_color; }
+            .bubo-me { background: var(--accent-bg-color); color: var(--accent-fg-color); }
             .bubo-them { background: alpha(currentColor, 0.08); }
             .bubo-image { border-radius: 16px; }
             .bubo-thread row { background: transparent; border: none; box-shadow: none; padding: 0; margin: 2px 0; }
             .bubo-meta { font-size: 0.8em; opacity: 0.7; }
             .bubo-snippet { opacity: 0.7; }
+            .bubo-convs row { padding: 6px 6px; }
+            .bubo-badge { background: var(--accent-bg-color); color: var(--accent-fg-color); border-radius: 999px;
+                          min-width: 8px; min-height: 8px; padding: 2px; font-size: 0.65em; font-weight: bold;
+                          border: 2px solid var(--window-bg-color); margin: -2px; }
+            .navigation-sidebar row:selected .bubo-badge { border-color: transparent; }
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
@@ -188,7 +193,7 @@ impl ChatsView {
     fn handle(self: &Rc<Self>, ev: Event) {
         match ev {
             Event::Conversation(c) => { self.upsert_conv(Conv::from_proto(&c)); self.rebuild_list(); }
-            Event::Message { msg, is_old } => { let m = Msg::from_proto(&msg); self.maybe_notify(&m, is_old); self.push_message(m); }
+            Event::Message { msg, is_old } => { let m = Msg::from_proto(&msg); self.maybe_notify(&m, is_old); self.push_message(m, is_old); }
             Event::PhoneNotResponding => { self.banner.set_title("Your phone isn't responding — is it online?"); self.banner.set_revealed(true); }
             Event::PhoneRespondingAgain | Event::Connected => self.banner.set_revealed(false),
             Event::ListenError(e) => { self.banner.set_title(&format!("Connection trouble: {e}")); self.banner.set_revealed(true); }
@@ -206,7 +211,10 @@ impl ChatsView {
 
     fn upsert_conv(&self, c: Conv) {
         let mut st = self.st.borrow_mut();
-        match st.convs.iter_mut().find(|x| x.id == c.id) { Some(x) => *x = c, None => st.convs.push(c) }
+        match st.convs.iter_mut().find(|x| x.id == c.id) {
+            Some(x) => { let n = if c.unread { x.unread_count } else { 0 }; *x = c; x.unread_count = n; }
+            None => st.convs.push(c),
+        }
         st.convs.sort_by(|a, b| b.ts.cmp(&a.ts));
     }
 
@@ -262,20 +270,25 @@ impl ChatsView {
         if conv.unread && !conv.latest_message_id.is_empty() {
             let c = self.client.clone(); let (id2, mid) = (id.to_string(), conv.latest_message_id.clone());
             crate::rt::spawn(async move { let _ = c.mark_read(&id2, &mid).await; });
-            if let Some(x) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == id) { x.unread = false; }
+            if let Some(x) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == id) { x.unread = false; x.unread_count = 0; }
             self.rebuild_list();
         }
     }
 
-    fn push_message(self: &Rc<Self>, m: Msg) {
+    fn push_message(self: &Rc<Self>, m: Msg, is_old: bool) {
         let conv_id = m.conversation_id.clone();
-        {
+        let viewing = self.st.borrow().current.as_deref() == Some(&conv_id);
+        let is_new = {
             let mut st = self.st.borrow_mut();
             let list = st.messages.entry(conv_id.clone()).or_default();
-            if let Some(x) = list.iter_mut().find(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) { *x = m.clone(); }
-            else { list.push(m.clone()); list.sort_by_key(|m| m.ts); }
+            if let Some(x) = list.iter_mut().find(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) { *x = m.clone(); false }
+            else { list.push(m.clone()); list.sort_by_key(|m| m.ts); true }
+        };
+        if is_new && !is_old && !m.from_me && !viewing {
+            if let Some(c) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == conv_id) { c.unread = true; c.unread_count += 1; }
+            self.rebuild_list();
         }
-        if self.st.borrow().current.as_deref() == Some(&conv_id) { self.render_thread(); }
+        if viewing { self.render_thread(); }
     }
 
     fn render_thread(self: &Rc<Self>) {
@@ -429,19 +442,38 @@ impl ChatsView {
     }
 }
 
+/// One conversation in the sidebar, laid out Teams-style: the name and a single-line preview
+/// together stand exactly as tall as the avatar, with the time top-right and an unread badge
+/// pinned to the avatar's corner (blank for one unread message, a count for more).
 fn conv_row(c: &Conv) -> gtk4::ListBoxRow {
-    let avatar = adw::Avatar::new(40, Some(&c.name), true);
+    const SIZE: i32 = 40;
+    let avatar = adw::Avatar::new(SIZE, Some(&c.name), true);
     if c.is_group { avatar.set_icon_name(Some("system-users-symbolic")); }
-    let name = gtk4::Label::builder().label(&c.name).xalign(0.0).ellipsize(gtk4::pango::EllipsizeMode::End).hexpand(true).build();
+    let overlay = gtk4::Overlay::builder().child(&avatar).valign(gtk4::Align::Center).build();
+    if c.unread {
+        let badge = gtk4::Label::builder().css_classes(["bubo-badge"]).halign(gtk4::Align::End).valign(gtk4::Align::End).build();
+        if c.unread_count > 1 { badge.set_label(&c.unread_count.to_string()); }
+        overlay.add_overlay(&badge);
+    }
+
+    let name = gtk4::Label::builder().label(&c.name).xalign(0.0).ellipsize(gtk4::pango::EllipsizeMode::End).hexpand(true).valign(gtk4::Align::End).build();
     if c.unread { name.add_css_class("heading"); }
-    let time = gtk4::Label::builder().label(fmt_time(c.ts)).css_classes(["bubo-meta"]).build();
-    let snippet = gtk4::Label::builder().label(&c.snippet).xalign(0.0).ellipsize(gtk4::pango::EllipsizeMode::End).css_classes(["bubo-snippet", "caption"]).build();
-    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6); top.append(&name); top.append(&time);
-    let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).hexpand(true).valign(gtk4::Align::Center).build();
+    let time = gtk4::Label::builder().label(fmt_time(c.ts)).css_classes(["bubo-meta"]).valign(gtk4::Align::End).build();
+    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 8); top.append(&name); top.append(&time);
+
+    let preview = if c.snippet.is_empty() { String::new() }
+        else if c.last_from_me { format!("You: {}", c.snippet) }
+        else if c.is_group && !c.last_sender.is_empty() { format!("{}: {}", c.last_sender, c.snippet) }
+        else { c.snippet.clone() };
+    let snippet = gtk4::Label::builder().label(preview.replace('\n', " ")).xalign(0.0).ellipsize(gtk4::pango::EllipsizeMode::End)
+        .single_line_mode(true).valign(gtk4::Align::Start).css_classes(["bubo-snippet", "caption"]).build();
+
+    // Two rows sharing the avatar's height: name sits on the midline, preview hangs below it.
+    let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).homogeneous(true).hexpand(true).height_request(SIZE).valign(gtk4::Align::Center).build();
     col.append(&top); col.append(&snippet);
-    let row_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(10).margin_top(6).margin_bottom(6).margin_start(4).margin_end(4).build();
-    row_box.append(&avatar); row_box.append(&col);
-    if c.unread { row_box.append(&gtk4::Image::builder().icon_name("media-record-symbolic").pixel_size(10).css_classes(["accent"]).build()); }
+
+    let row_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).build();
+    row_box.append(&overlay); row_box.append(&col);
     let row = gtk4::ListBoxRow::builder().child(&row_box).build();
     unsafe { row.set_data("conv-id", c.id.clone()); }
     row
