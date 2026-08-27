@@ -260,8 +260,9 @@ impl Client {
                 while i < buf.len() && (buf[i] == b',' || buf[i].is_ascii_whitespace()) { i += 1; }
                 if !opened {
                     if buf.len() < i + 2 { buf.drain(..i); break; }
-                    if &buf[i..i + 2] != b"[[" { tracing::warn!("stream did not open with [["); return; }
-                    opened = true; i += 1; // keep the inner '[' as the start of the first element
+                    if &buf[i..i + 2] != b"[[" { tracing::warn!("stream did not open with [[: {:?}", String::from_utf8_lossy(&buf[..buf.len().min(40)])); return; }
+                    // Body is `[[` frame `,` frame … `]]` — each frame is itself a JSON array.
+                    opened = true; i += 2;
                 }
                 if i >= buf.len() { buf.clear(); break; }
                 if buf[i] == b']' { tracing::debug!("stream end marker"); return; }
@@ -499,6 +500,24 @@ impl Client {
     }
     pub async fn is_bugle_default(&self) -> Result<bool> {
         Ok(self.call::<_, IsBugleDefaultResponse>(ActionType::IsBugleDefault, EmptyArr {}, false).await?.success)
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::balanced_json;
+    #[test]
+    fn frames() {
+        let body = br#"[[[null,null,null,[0]],[null,null,[]],[null,["id",19]]]]"#;
+        let mut i = 2; let mut frames = vec![];
+        loop {
+            while body[i] == b',' { i += 1; }
+            if body[i] == b']' { break; }
+            let n = balanced_json(&body[i..]).unwrap();
+            frames.push(std::str::from_utf8(&body[i..i + n]).unwrap().to_string());
+            i += n;
+        }
+        assert_eq!(frames, vec!["[null,null,null,[0]]", "[null,null,[]]", r#"[null,["id",19]]"#]);
     }
 }
 
