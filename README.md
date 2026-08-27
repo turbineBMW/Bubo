@@ -40,8 +40,7 @@ confirm a new device — pick the matching emoji there.
 
 ## How the protocol works
 
-QR registration + stream verified live 2026-08-27; the Gaia flow is ported from
-mautrix-gmessages' behaviour and needs a live run to confirm.
+Google-account (emoji) pairing and message sync verified live end-to-end 2026-08-27.
 
 1. Google-account pairing: with the browser's cookies (`SAPISID` → `SAPISIDHASH`
    Authorization header), `GET /web/config` gives a device ID, then
@@ -85,3 +84,19 @@ Bubo's code is MIT. The `.proto` files describe Google's wire format and were ta
 from [mautrix-gmessages](https://github.com/mautrix/gmessages) (AGPL-3.0); the Rust
 in `src/gm/` was written from the protocol description, not translated from Go.
 If you consider the proto files copyrightable expression, treat `proto/` as AGPL.
+
+## Login gotchas (learned the hard way)
+
+- **OSID is mandatory.** messages.google.com/web/config authenticates with the origin-scoped
+  `OSID` cookie, which Google only sets *while the /web app page loads* (an accounts→messages
+  redirect). Harvesting cookies at the sign-in redirect gives `SAPISID` but not `OSID`, and
+  config then 401s to `ServiceLogin?...osid=1`. So we let /web load and poll the jar until both
+  `SAPISID` and `OSID` are present.
+- **The live web app is a rival pairing client.** Once messages/web boots, its JS starts its own
+  UKEY2 handshake. If ours is in flight at the same time, the phone reports `NOT_LATEST_ATTEMPT`
+  (error 13/10) and shows the web app's emoji, not ours. Fix: fully tear down the WebView, then
+  start our pairing so ours is the latest attempt.
+- **Never touch WebKit widgets from inside their own callbacks** (cookie/policy/load) — destroying
+  the WebView there segfaults. Defer with `idle_add_local_once` / `timeout_add_local_once`.
+- **Long-poll framing:** the body is `[[` frame `,` frame … `]]` where each frame is itself a JSON
+  array; skip *both* opening brackets, and never wait for the outer array to close.

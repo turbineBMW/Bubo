@@ -1,7 +1,7 @@
 //! Google sign-in in a WebView. Once messages.google.com has a SAPISID cookie we own a
 //! signed-in session; hand the cookies to the client and run the emoji pairing.
 use crate::gm::client::Client;
-use adw::prelude::*;
+#[allow(unused_imports)] use adw::prelude::*;
 #[allow(unused_imports)] use gtk4::prelude::*;
 
 use std::cell::Cell;
