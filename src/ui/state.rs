@@ -21,7 +21,11 @@ impl Msg {
         for i in &m.message_info {
             match &i.data {
                 Some(message_info::Data::MessageContent(c)) => text.push(c.content.clone()),
-                Some(message_info::Data::MediaContent(mc)) => media.push(Media { id: mc.media_id.clone(), key: mc.decryption_key.clone(), name: mc.media_name.clone(), mime: mc.mime_type.clone() }),
+                Some(message_info::Data::MediaContent(mc)) => media.push(Media {
+                    id: mc.media_id.clone(), key: mc.decryption_key.clone(),
+                    thumb_id: mc.thumbnail_media_id.clone(), thumb_key: mc.thumbnail_decryption_key.clone(),
+                    inline: mc.media_data.clone(), name: mc.media_name.clone(), mime: mc.mime_type.clone(),
+                }),
                 None => {}
             }
         }
@@ -40,12 +44,22 @@ impl Msg {
 pub struct Media {
     pub id: String,
     pub key: Vec<u8>,
+    pub thumb_id: String,
+    pub thumb_key: Vec<u8>,
+    /// Small attachments arrive with their bytes inline instead of a downloadable id.
+    pub inline: Vec<u8>,
     pub name: String,
     pub mime: String,
 }
 impl Media {
     pub fn is_image(&self) -> bool { self.mime.starts_with("image/") }
     pub fn label(&self) -> String { if self.name.is_empty() { self.mime.clone() } else { self.name.clone() } }
+    /// The best (attachment_id, key) to download, preferring the full image over the thumbnail.
+    pub fn source(&self) -> Option<(String, Vec<u8>)> {
+        if !self.id.is_empty() { Some((self.id.clone(), self.key.clone())) }
+        else if !self.thumb_id.is_empty() { Some((self.thumb_id.clone(), self.thumb_key.clone())) }
+        else { None }
+    }
 }
 
 #[derive(Clone, Debug)]

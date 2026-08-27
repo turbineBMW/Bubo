@@ -368,15 +368,33 @@ impl ChatsView {
     /// A clickable attachment: images load inline on click; other files save to ~/Downloads.
     fn attachment_widget(self: &Rc<Self>, md: &Media) -> gtk4::Widget {
         let icon = if md.is_image() { "🖼" } else { "📎" };
-        let btn = gtk4::Button::builder().label(&format!("{icon} {}", md.label())).css_classes(["flat"]).halign(gtk4::Align::Start).build();
         let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+
+        // Inline bytes (no download needed) — render or offer to save immediately.
+        if !md.inline.is_empty() {
+            if md.is_image() {
+                if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&md.inline)) {
+                    let pic = gtk4::Picture::for_paintable(&tex);
+                    pic.set_can_shrink(true); pic.set_content_fit(gtk4::ContentFit::ScaleDown); pic.set_size_request(-1, 240); pic.set_halign(gtk4::Align::Start);
+                    holder.append(&pic);
+                    return holder.upcast();
+                }
+            }
+        }
+
+        let btn = gtk4::Button::builder().label(&format!("{icon} {}", md.label())).css_classes(["flat"]).halign(gtk4::Align::Start).build();
         holder.append(&btn);
+        let Some((att_id, key)) = md.source() else {
+            btn.set_sensitive(false);
+            btn.set_label(&format!("{icon} {} (not available)", md.label()));
+            return holder.upcast();
+        };
         let (me, md, holder2, btn2) = (self.clone(), md.clone(), holder.clone(), btn.clone());
         btn.connect_clicked(move |_| {
             btn2.set_sensitive(false);
             btn2.set_label(&format!("⏳ {}", md.label()));
             let (tx, rx) = async_channel::bounded(1);
-            let (c, id, key) = (me.client.clone(), md.id.clone(), md.key.clone());
+            let (c, id, key) = (me.client.clone(), att_id.clone(), key.clone());
             crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
             let (me, md, holder2, btn2) = (me.clone(), md.clone(), holder2.clone(), btn2.clone());
             glib::spawn_future_local(async move {
@@ -386,12 +404,8 @@ impl ChatsView {
                             match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
                                 Ok(tex) => {
                                     let pic = gtk4::Picture::for_paintable(&tex);
-                                    pic.set_can_shrink(true);
-                                    pic.set_content_fit(gtk4::ContentFit::ScaleDown);
-                                    pic.set_size_request(-1, 240);
-                                    pic.set_halign(gtk4::Align::Start);
-                                    holder2.remove(&btn2);
-                                    holder2.append(&pic);
+                                    pic.set_can_shrink(true); pic.set_content_fit(gtk4::ContentFit::ScaleDown); pic.set_size_request(-1, 240); pic.set_halign(gtk4::Align::Start);
+                                    holder2.remove(&btn2); holder2.append(&pic);
                                 }
                                 Err(e) => { btn2.set_sensitive(true); btn2.set_label(&format!("🖼 {}", md.label())); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
                             }

@@ -528,8 +528,13 @@ impl Client {
         };
         let metadata = B64.encode(req.encode_to_vec());
         let resp = self.http.get(http::url_upload_media()).headers(http::download_headers(&metadata)).send().await?;
-        if !resp.status().is_success() { bail!("media download HTTP {}", resp.status()); }
+        let status = resp.status();
         let body = resp.bytes().await?;
+        if !status.is_success() {
+            tracing::warn!(%attachment_id, %status, key_len = key.len(), body = %String::from_utf8_lossy(&body[..body.len().min(300)]), "media download failed");
+            bail!("media download HTTP {status}");
+        }
+        if key.is_empty() { return Ok(body.to_vec()); } // unencrypted attachment
         crate::gm::crypto::MediaCrypto::new(key)?.decrypt(&body)
     }
 
