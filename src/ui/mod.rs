@@ -10,6 +10,7 @@ use gtk4::glib;
 use std::rc::Rc;
 
 pub fn build(app: &adw::Application) {
+    if let Some(display) = gtk4::gdk::Display::default() { crate::accent::install_fallback(&display); }
     let win = adw::ApplicationWindow::builder().application(app).title("Bubo").default_width(1000).default_height(700).build();
     let stack = gtk4::Stack::builder().transition_type(gtk4::StackTransitionType::Crossfade).build();
     win.set_content(Some(&stack));

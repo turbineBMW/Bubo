@@ -1,3 +1,4 @@
+mod accent;
 mod gm;
 mod rt;
 mod ui;
