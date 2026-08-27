@@ -62,6 +62,31 @@ pub struct ChatsView {
     composer: gtk4::Box,
     settings: Rc<RefCell<crate::settings::Settings>>,
     notifier: Option<Rc<crate::notify::Notifier>>,
+    /// The "+" in the sidebar header that opens the new-conversation picker.
+    new_chat: gtk4::Button,
+    /// The phone's address book, fetched on first use of the picker and kept for the session.
+    contacts: Rc<RefCell<Option<Rc<Vec<ContactEntry>>>>>,
+}
+
+/// One address-book entry as the picker shows it.
+#[derive(Clone, Debug)]
+struct ContactEntry {
+    name: String,
+    /// The dialable number, as the phone reports it (usually E.164).
+    number: String,
+    /// Pretty form for display, falling back to `number`.
+    formatted: String,
+    participant_id: String,
+}
+
+/// Keep only what a dialler would: a leading `+` and digits. `None` if the text doesn't look
+/// like a phone number at all (letters, or fewer than three digits).
+fn normalise_number(input: &str) -> Option<String> {
+    let t = input.trim();
+    if t.is_empty() || !t.chars().all(|c| c.is_ascii_digit() || "+ ()-.".contains(c)) { return None; }
+    let digits: String = t.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 3 { return None; }
+    Some(if t.starts_with('+') { format!("+{digits}") } else { digits })
 }
 
 /// A centred spinner with a caption, used while a pane is waiting on the phone.
@@ -91,6 +116,8 @@ impl ChatsView {
         menu.append(Some("Preferences"), Some("app.preferences"));
         menu.append(Some("Unpair phone"), Some("app.unpair"));
         side_header.pack_end(&gtk4::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build());
+        let new_chat = gtk4::Button::builder().icon_name("list-add-symbolic").tooltip_text("New conversation").build();
+        side_header.pack_start(&new_chat);
         let side_empty = adw::StatusPage::builder().icon_name("chat-message-new-symbolic").title("No conversations").description("Messages from your phone will show up here.").build();
         let side_stack = stack(&[("loading", &loading_page("Loading conversations…")), ("empty", side_empty.upcast_ref()), ("list", side_scroll.upcast_ref())]);
         let side = adw::ToolbarView::new();
@@ -140,7 +167,7 @@ impl ChatsView {
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
         let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer,
-            settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new() };
+            settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -170,6 +197,8 @@ impl ChatsView {
         let me = self.clone();
         prefs.connect_activate(move |_, _| me.show_preferences());
         if let Some(app) = self.win.application() { app.add_action(&prefs); }
+        let me = self.clone();
+        self.new_chat.connect_clicked(move |_| me.show_new_chat());
         // selection → open thread
         let me = self.clone();
         self.list.connect_row_selected(move |_, row| {
@@ -578,6 +607,119 @@ impl ChatsView {
     fn jump_to(self: &Rc<Self>, id: &str) {
         let row = self.st.borrow().rows.get(id).cloned();
         match row { Some(row) => self.list.select_row(Some(&row)), None => self.open(id) }
+    }
+
+    /// A picker over the phone's contacts, with a free-text row for numbers not in the book.
+    fn show_new_chat(self: &Rc<Self>) {
+        let dialog = adw::Dialog::builder().title("New conversation").content_width(400).content_height(560).build();
+        let search = gtk4::SearchEntry::builder().placeholder_text("Name or phone number").margin_start(12).margin_end(12).margin_bottom(6).build();
+        let list = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["navigation-sidebar"]).build();
+        let scroll = gtk4::ScrolledWindow::builder().child(&list).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
+        let empty = adw::StatusPage::builder().icon_name("system-search-symbolic").title("No matches").description("Type a phone number to message someone new.").build();
+        let pages = stack(&[("loading", &loading_page("Loading contacts…")), ("list", scroll.upcast_ref()), ("empty", empty.upcast_ref())]);
+        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        col.append(&search); col.append(&pages);
+        let tv = adw::ToolbarView::new();
+        tv.add_top_bar(&adw::HeaderBar::new());
+        tv.set_content(Some(&col));
+        dialog.set_child(Some(&tv));
+
+        // Rebuild the rows for the current query. Each row carries the number to dial.
+        let me_w = Rc::downgrade(self);
+        let (list2, pages2) = (list.clone(), pages.clone());
+        let fill: Rc<dyn Fn(&str)> = Rc::new(move |query: &str| {
+            let Some(me) = me_w.upgrade() else { return };
+            let Some(contacts) = me.contacts.borrow().clone() else { pages2.set_visible_child_name("loading"); return };
+            while let Some(r) = list2.row_at_index(0) { list2.remove(&r); }
+            let q = query.trim().to_lowercase();
+            let qdigits: String = q.chars().filter(|c| c.is_ascii_digit()).collect();
+            let mut n = 0;
+            if let Some(num) = normalise_number(query) {
+                let row = adw::ActionRow::builder().title(format!("Send to {num}")).subtitle("Not in your contacts").activatable(true).build();
+                let icon = gtk4::Image::from_icon_name("phone-symbolic"); icon.set_pixel_size(24);
+                row.add_prefix(&icon);
+                unsafe { row.set_data("number", num); }
+                list2.append(&row); n += 1;
+            }
+            let avatars = me.avatars.borrow();
+            for c in contacts.iter() {
+                let hit = q.is_empty() || c.name.to_lowercase().contains(&q)
+                    || (!qdigits.is_empty() && c.number.chars().filter(|c| c.is_ascii_digit()).collect::<String>().contains(&qdigits));
+                if !hit { continue; }
+                let row = adw::ActionRow::builder().title(glib::markup_escape_text(&c.name)).subtitle(glib::markup_escape_text(&c.formatted)).activatable(true).build();
+                let av = adw::Avatar::new(32, Some(&c.name), true);
+                if let Some(Some(tex)) = avatars.get(&c.participant_id) { av.set_custom_image(Some(tex)); }
+                row.add_prefix(&av);
+                unsafe { row.set_data("number", c.number.clone()); }
+                list2.append(&row); n += 1;
+            }
+            pages2.set_visible_child_name(if n == 0 { "empty" } else { "list" });
+        });
+
+        let f = fill.clone();
+        search.connect_search_changed(move |e| f(&e.text()));
+        let (me, d) = (self.clone(), dialog.clone());
+        list.connect_row_activated(move |_, row| {
+            let Some(num) = (unsafe { row.data::<String>("number").map(|p| p.as_ref().clone()) }) else { return };
+            d.close();
+            me.start_conversation(num);
+        });
+        // Enter in the search box takes the first row (the typed number, or the best match).
+        let l = list.clone();
+        search.connect_activate(move |_| { if let Some(row) = l.row_at_index(0) { l.emit_by_name::<()>("row-activated", &[&row]); } });
+
+        fill("");
+        if self.contacts.borrow().is_none() {
+            let c = self.client.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            crate::rt::spawn(async move { let _ = tx.send(c.list_contacts().await).await; });
+            let (me, f, s, toast) = (self.clone(), fill.clone(), search.clone(), self.toast.clone());
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(r)) => {
+                        let mut v: Vec<ContactEntry> = r.contacts.into_iter().filter_map(|c| {
+                            let n = c.number?;
+                            let number = if !n.number.is_empty() { n.number } else { n.number2 };
+                            if number.is_empty() { return None; }
+                            let formatted = n.formatted_number.filter(|f| !f.is_empty()).unwrap_or_else(|| number.clone());
+                            let name = if c.name.is_empty() { formatted.clone() } else { c.name };
+                            Some(ContactEntry { name, number, formatted, participant_id: c.participant_id })
+                        }).collect();
+                        v.sort_by_key(|c| c.name.to_lowercase());
+                        *me.contacts.borrow_mut() = Some(Rc::new(v));
+                    }
+                    Ok(Err(e)) => { *me.contacts.borrow_mut() = Some(Rc::new(Vec::new())); toast.add_toast(adw::Toast::new(&format!("Could not load contacts: {e:#}"))); }
+                    Err(_) => return,
+                }
+                f(&s.text());
+            });
+        }
+        dialog.present(Some(&self.win));
+        search.grab_focus();
+    }
+
+    /// Ask the phone for the thread with `number` (creating it if needed), then open it.
+    fn start_conversation(self: &Rc<Self>, number: String) {
+        let c = self.client.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        let n = number.clone();
+        crate::rt::spawn(async move { let _ = tx.send(c.get_or_create_conversation(&[n]).await).await; });
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(r)) => match r.conversation {
+                    Some(conv) => {
+                        let id = conv.conversation_id.clone();
+                        me.upsert_conv(Conv::from_proto(&conv));
+                        me.rebuild_list(); me.fetch_avatars();
+                        me.jump_to(&id);
+                    }
+                    None => me.toast.add_toast(adw::Toast::new(&format!("Your phone couldn't start a chat with {number}"))),
+                },
+                Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Could not start conversation: {e:#}"))),
+                Err(_) => {}
+            }
+        });
     }
 
     fn show_preferences(self: &Rc<Self>) {
