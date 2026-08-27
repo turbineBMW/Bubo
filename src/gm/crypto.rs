@@ -72,7 +72,7 @@ impl RefreshKey {
 }
 
 /// p256 0.13 still speaks rand_core 0.6; bridge from the OS RNG.
-fn rand_core06() -> impl p256::elliptic_curve::rand_core::CryptoRngCore {
+pub fn rand_core06() -> impl p256::elliptic_curve::rand_core::CryptoRngCore {
     struct Os;
     impl p256::elliptic_curve::rand_core::RngCore for Os {
         fn next_u32(&mut self) -> u32 { rand::rng().next_u32() }

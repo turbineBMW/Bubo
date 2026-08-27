@@ -4,6 +4,7 @@ pub mod auth;
 pub mod client;
 pub mod crypto;
 pub mod events;
+pub mod gaia;
 pub mod http;
 pub mod pblite;
 pub mod proto;

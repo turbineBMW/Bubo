@@ -1,7 +1,7 @@
 //! libadwaita UI. All state lives on the GTK thread; the protocol client runs on tokio
 //! and reports back through an async-channel drained by a glib-local future.
 mod chats;
-mod pair;
+mod login;
 mod state;
 
 use crate::gm;
@@ -23,16 +23,36 @@ pub fn build(app: &adw::Application) {
 
 fn start_pairing(win: &adw::ApplicationWindow, stack: &gtk4::Stack) {
     let (client, events) = match gm::client::Client::new(gm::auth::AuthData::new()) { Ok(x) => x, Err(e) => { fatal(stack, &format!("{e:#}")); return; } };
-    let page = pair::PairPage::new(client.clone());
-    stack.add_named(&page.widget, Some("pair"));
-    stack.set_visible_child_name("pair");
+    let emoji_page = Rc::new(login::EmojiPage::new());
+    stack.add_named(&emoji_page.widget, Some("emoji"));
+    let (ptx, prx) = async_channel::unbounded::<login::PairProgress>();
+    let login_page = login::LoginPage::new({
+        let (client, stack, ptx) = (client.clone(), stack.clone(), ptx.clone());
+        move |cookies| {
+            tracing::info!("got Google session cookies");
+            client.auth.lock().unwrap().cookies = cookies;
+            stack.set_visible_child_name("emoji");
+            login::run_gaia_pairing(client.clone(), ptx.clone());
+        }
+    });
+    stack.add_named(&login_page.widget, Some("login"));
+    stack.set_visible_child_name("login");
     let (win, stack) = (win.clone(), stack.clone());
+    let ep = emoji_page.clone();
+    glib::spawn_future_local(async move {
+        while let Ok(p) = prx.recv().await {
+            match p {
+                login::PairProgress::Emoji(e) => ep.show_emoji(&e),
+                login::PairProgress::Done(_) => ep.paired(),
+                login::PairProgress::Failed(e) => ep.error(&e),
+            }
+        }
+    });
     glib::spawn_future_local(async move {
         while let Ok(ev) = events.recv().await {
             match ev {
-                gm::events::Event::Paired { .. } => { page.paired(); }
                 gm::events::Event::Connected => { show_chats(&win, &stack, client.clone(), events.clone()); return; }
-                gm::events::Event::ListenFatal(e) => page.error(&e),
+                gm::events::Event::ListenFatal(e) => emoji_page.error(&e),
                 _ => {}
             }
         }

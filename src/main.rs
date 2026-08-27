@@ -12,6 +12,7 @@ fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("pair") => return rt::block_on(cli_pair()),
+        Some("login") => return rt::block_on(cli_login()),
         Some("probe") => return rt::block_on(cli_probe(args.get(2).cloned())),
         Some("send") => return rt::block_on(cli_send(args.get(2).cloned().unwrap_or_default(), args[3..].join(" "))),
         Some("unpair") => return rt::block_on(cli_unpair()),
@@ -35,6 +36,30 @@ async fn cli_pair() -> anyhow::Result<()> {
             gm::events::Event::Paired { phone_id } => { println!("paired with {phone_id}; saved {}", gm::auth::path().display()); return Ok(()); }
             gm::events::Event::ListenFatal(e) => anyhow::bail!("listen failed: {e}"),
             e => tracing::debug!(?e, "event"),
+        }
+    }
+}
+
+/// `bubo login` — headless Google-account pairing. Paste the `Cookie:` header of a request
+/// to messages.google.com from a signed-in browser (DevTools → Network → any request → Request Headers).
+async fn cli_login() -> anyhow::Result<()> {
+    println!("Paste the Cookie header value from a signed-in messages.google.com tab, then Enter:");
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let mut auth = gm::auth::AuthData::new();
+    auth.cookies = line.trim().trim_start_matches("Cookie:").trim().split(';').filter_map(|kv| kv.trim().split_once('=')).map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    if !auth.has_cookies() { anyhow::bail!("no SAPISID cookie in that header — are you signed in?"); }
+    let (client, events) = gm::client::Client::new(auth)?;
+    let (emoji, ps) = client.start_gaia_pairing().await?;
+    println!("\n    Tap this emoji on your phone:   {emoji}\n");
+    let id = client.finish_gaia_pairing(ps).await?;
+    println!("paired with {id}; saved {}", gm::auth::path().display());
+    // wait for the reconnect to open so a bad key shows up now rather than on next launch
+    loop {
+        match tokio::time::timeout(std::time::Duration::from_secs(30), events.recv()).await?? {
+            gm::events::Event::Connected => { println!("connected"); return Ok(()); }
+            gm::events::Event::ListenFatal(e) => anyhow::bail!("{e}"),
+            _ => {}
         }
     }
 }

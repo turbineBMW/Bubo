@@ -1,5 +1,6 @@
 //! The Messages-for-Web client: pairing, token refresh, long-poll, and typed RPCs.
 use crate::gm::auth::{AuthData, QR_NETWORK};
+use crate::gm::proto::config::Config;
 use crate::gm::events::Event;
 use crate::gm::http;
 use crate::gm::proto::authentication::*;
@@ -34,18 +35,22 @@ pub struct Client {
     conversations_fetched: AtomicBool,
     refresh_lock: AsyncMutex<()>,
     me: std::sync::Weak<Client>,
+    pub(crate) stream_opened: tokio::sync::Notify,
 }
 
 pub struct SendOpts {
     pub request_id: Option<String>,
     pub omit_ttl: bool,
+    pub custom_ttl: Option<i64>,
+    pub dont_encrypt: bool,
     pub message_type: MessageType,
     pub expect_response: bool,
 }
 impl Default for SendOpts {
-    fn default() -> Self { Self { request_id: None, omit_ttl: false, message_type: MessageType::BugleMessage, expect_response: true } }
+    fn default() -> Self { Self { request_id: None, omit_ttl: false, custom_ttl: None, dont_encrypt: false, message_type: MessageType::BugleMessage, expect_response: true } }
 }
 
+#[allow(dead_code)]
 impl Client {
     pub fn new(auth: AuthData) -> Result<(Arc<Self>, async_channel::Receiver<Event>)> {
         let (tx, rx) = async_channel::unbounded();
@@ -53,16 +58,39 @@ impl Client {
         let c = Arc::new_cyclic(|me| Self {
             auth: Mutex::new(auth), http, lp_http,
             session: Session::default(), events: tx, listen_id: AtomicU64::new(0), skip_count: AtomicI64::new(0),
-            conversations_fetched: AtomicBool::new(false), refresh_lock: AsyncMutex::new(()), me: me.clone(),
+            conversations_fetched: AtomicBool::new(false), refresh_lock: AsyncMutex::new(()), me: me.clone(), stream_opened: tokio::sync::Notify::new(),
         });
         c.session.reset_session_id();
         Ok((c, rx))
     }
 
-    fn emit(&self, e: Event) { let _ = self.events.try_send(e); }
+    pub(crate) fn emit(&self, e: Event) { let _ = self.events.try_send(e); }
+    pub(crate) fn is_google(&self) -> bool { self.auth.lock().unwrap().is_google() }
+    fn network(&self) -> &'static str { self.auth.lock().unwrap().network() }
+    /// POST through the relay, attaching Google cookies when we have them and absorbing any refreshed ones.
+    pub(crate) async fn post(&self, long_poll: bool, url: &str, body: http::Body) -> Result<reqwest::Response> {
+        let cookies = self.auth.lock().unwrap().cookie_headers();
+        let cli = if long_poll { &self.lp_http } else { &self.http };
+        let resp = http::post(cli, url, body, cookies).await?;
+        let set: Vec<String> = resp.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok().map(String::from)).collect();
+        if !set.is_empty() { self.auth.lock().unwrap().absorb_set_cookies(set.iter().map(String::as_str)); }
+        Ok(resp)
+    }
+    /// GET `/web/config` — the web client's bootstrap; yields our device/session ID.
+    pub(crate) async fn fetch_config(&self) -> Result<Config> {
+        let cookies = self.auth.lock().unwrap().cookie_headers();
+        let mut h = http::relay_headers(None);
+        h.remove("x-user-agent"); h.remove("origin");
+        h.insert("sec-fetch-site", "same-origin".parse().unwrap());
+        let mut req = self.http.get(http::URL_CONFIG).headers(h);
+        if let Some((c, a)) = cookies { req = req.header("cookie", c).header("authorization", a); }
+        let cfg: Config = http::parse(req.send().await?).await?;
+        if let Some(id) = cfg.device_info.as_ref().map(|d| d.device_id.clone()).filter(|s| !s.is_empty()) { self.auth.lock().unwrap().session_id = Some(id); }
+        Ok(cfg)
+    }
     fn token(&self) -> Vec<u8> { self.auth.lock().unwrap().tachyon_token.clone() }
     pub fn is_paired(&self) -> bool { self.auth.lock().unwrap().is_paired() }
-    fn save_auth(&self) { if let Err(e) = self.auth.lock().unwrap().save() { tracing::error!("saving auth: {e:#}"); } }
+    pub(crate) fn save_auth(&self) { if let Err(e) = self.auth.lock().unwrap().save() { tracing::error!("saving auth: {e:#}"); } }
 
     // ───────────────────────────── pairing ─────────────────────────────
 
@@ -75,7 +103,7 @@ impl Client {
             browser_details: Some(browser_details()),
             data: Some(authentication_container::Data::KeyData(KeyData { ecdsa_keys: Some(EcdsaKeys { field1: 2, encrypted_keys: key }), ..Default::default() })),
         };
-        let resp: RegisterPhoneRelayResponse = http::parse(http::post(&self.http, &http::url_register_phone_relay(), http::body_proto(&payload)).await?).await?;
+        let resp: RegisterPhoneRelayResponse = http::parse(self.post(false, &http::url_register_phone_relay(), http::body_proto(&payload)).await?).await?;
         let tok = resp.auth_key_data.as_ref().ok_or_else(|| anyhow!("no auth key data in RegisterPhoneRelay response"))?;
         self.auth.lock().unwrap().update_token(tok);
         let me = self.clone();
@@ -92,7 +120,7 @@ impl Client {
     /// Ask for a fresh pairing key (the QR expires); returns a new QR URL.
     pub async fn refresh_pairing(&self) -> Result<String> {
         let payload = AuthenticationContainer { auth_message: Some(auth_message(uuid::Uuid::new_v4().to_string(), &self.token(), QR_NETWORK)), ..Default::default() };
-        let resp: RefreshPhoneRelayResponse = http::parse(http::post(&self.http, &http::url_refresh_phone_relay(), http::body_proto(&payload)).await?).await?;
+        let resp: RefreshPhoneRelayResponse = http::parse(self.post(false, &http::url_refresh_phone_relay(), http::body_proto(&payload)).await?).await?;
         Ok(self.qr_url(&resp.pair_key))
     }
 
@@ -114,10 +142,11 @@ impl Client {
     }
 
     pub async fn unpair(&self) -> Result<()> {
+        if self.is_google() { return self.unpair_gaia().await; }
         let (tok, browser) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.browser_device()) };
         if tok.is_empty() || browser.is_none() { return Ok(()); }
         let payload = RevokeRelayPairingRequest { auth_message: Some(auth_message(uuid::Uuid::new_v4().to_string(), &tok, "")), browser };
-        let _: RevokeRelayPairingResponse = http::parse(http::post(&self.http, &http::url_revoke_relay_pairing(), http::body_proto(&payload)).await?).await?;
+        let _: RevokeRelayPairingResponse = http::parse(self.post(false, &http::url_revoke_relay_pairing(), http::body_proto(&payload)).await?).await?;
         Ok(())
     }
 
@@ -151,18 +180,20 @@ impl Client {
         let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64 * 1000;
         let sig = key.sign_refresh(&request_id, ts)?;
         let payload = RegisterRefreshRequest {
-            message_auth: Some(auth_message(request_id, &self.token(), "")),
+            message_auth: Some(auth_message(request_id, &self.token(), self.network())),
             curr_browser_device: Some(browser), unix_timestamp: ts, signature: sig,
             parameters: Some(register_refresh_request::Parameters { empty_arr: Some(EmptyArr {}), more_parameters: None }),
             message_type: 2,
         };
         tracing::debug!("refreshing tachyon token");
-        let resp: RegisterRefreshResponse = http::parse(http::post(&self.http, &http::url_register_refresh(), http::body_pblite(&payload)?).await?).await?;
+        let resp: RegisterRefreshResponse = http::parse(self.post(false, &http::url_register_refresh(), http::body_pblite(&payload)?).await?).await?;
         let tok = resp.token_data.filter(|t| !t.tachyon_auth_token.is_empty()).ok_or_else(|| anyhow!("no token in RegisterRefresh response"))?;
         self.auth.lock().unwrap().update_token(&tok);
         self.save_auth();
         Ok(())
     }
+
+    pub(crate) async fn long_poll_loop_pub(self: Arc<Self>, logged_in: bool) { self.long_poll_loop(logged_in).await }
 
     async fn long_poll_loop(self: Arc<Self>, logged_in: bool) {
         let my_id = self.listen_id.fetch_add(1, Ordering::SeqCst) + 1;
@@ -180,11 +211,11 @@ impl Client {
                 }
             }
             let payload = ReceiveMessagesRequest {
-                auth: Some(auth_message(listen_req_id.clone(), &self.token(), "")),
+                auth: Some(auth_message(listen_req_id.clone(), &self.token(), self.network())),
                 unknown: Some(receive_messages_request::UnknownEmptyObject2 { unknown: Some(receive_messages_request::UnknownEmptyObject1 {}) }),
             };
             let body = match http::body_pblite(&payload) { Ok(b) => b, Err(e) => { tracing::error!("encode: {e:#}"); return; } };
-            let resp = match http::post(&self.lp_http, &http::url_receive_messages(), body).await {
+            let resp = match self.post(true, &http::url_receive_messages(self.is_google()), body).await {
                 Ok(r) => r,
                 Err(e) => { errors += 1; self.emit(Event::ListenError(e.to_string())); tokio::time::sleep(Duration::from_secs((errors + 1) * 5)).await; continue; }
             };
@@ -199,6 +230,7 @@ impl Client {
             if self.listen_id.load(Ordering::SeqCst) != my_id { return; }
             errors = 0;
             tracing::debug!(listen = my_id, "long poll opened");
+            self.stream_opened.notify_waiters();
             if logged_in {
                 if first { first = false; let me = self.clone(); tokio::spawn(async move { me.post_connect().await; }); }
                 else if disconnected_at.map(|t| t.elapsed() > Duration::from_secs(60)).unwrap_or(false) {
@@ -260,7 +292,7 @@ impl Client {
             Err((id, e)) => { tracing::warn!("decode incoming {id}: {e:#}"); self.session.queue_ack(&id); return; }
         };
         self.session.queue_ack(&msg.response_id);
-        if self.session.deliver(&msg) { return; }
+        if self.session.deliver(&msg, self.is_google()) { return; }
         match msg.route {
             BugleRoute::PairEvent => {
                 if let Some(p) = &msg.pair {
@@ -302,6 +334,9 @@ impl Client {
     fn handle_update(&self, mut msg: Incoming) {
         if self.skip_count.load(Ordering::SeqCst) > 0 { self.skip_count.fetch_sub(1, Ordering::SeqCst); msg.is_old = true; }
         if msg.action() != ActionType::GetUpdates { tracing::debug!(action = ?msg.action(), "unsolicited response"); return; }
+        if msg.decrypted.is_none() && msg.message.as_ref().map(|m| m.unencrypted_data == [0x72, 0x00]).unwrap_or(false) {
+            self.emit(Event::ListenFatal("Google signed this session out".into())); return;
+        }
         let Some(dec) = &msg.decrypted else { return };
         let ev = match UpdateEvents::decode(dec.as_slice()) { Ok(e) => e, Err(e) => { tracing::warn!("UpdateEvents decode: {e}"); return; } };
         match ev.event {
@@ -353,11 +388,11 @@ impl Client {
         if ids.is_empty() { return; }
         let (tok, browser) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.browser_device()) };
         let payload = AckMessageRequest {
-            auth_data: Some(auth_message(uuid::Uuid::new_v4().to_string(), &tok, "")),
+            auth_data: Some(auth_message(uuid::Uuid::new_v4().to_string(), &tok, self.network())),
             empty_arr: Some(EmptyArr {}),
             acks: ids.iter().map(|id| ack_message_request::Message { request_id: id.clone(), device: browser.clone() }).collect(),
         };
-        let r: Result<OutgoingRpcResponse> = async { http::parse(http::post(&self.http, &http::url_ack_messages(), http::body_pblite(&payload)?).await?).await }.await;
+        let r: Result<OutgoingRpcResponse> = async { http::parse(self.post(false, &http::url_ack_messages(self.is_google()), http::body_pblite(&payload)?).await?).await }.await;
         if let Err(e) = r { tracing::warn!("acks failed, requeueing: {e:#}"); self.session.requeue_acks(ids); }
     }
 
@@ -381,9 +416,10 @@ impl Client {
     /// Send an action to the phone. With `expect_response`, waits (≤60 s) for the phone's reply.
     pub async fn send_rpc<M: Message>(&self, action: ActionType, data: Option<M>, opts: SendOpts) -> Result<Option<Incoming>> {
         let request_id = opts.request_id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let (tok, mobile, ttl, crypto) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.mobile_device(), a.tachyon_ttl, a.request_crypto.clone()) };
-        let encrypted = data.map(|d| crypto.encrypt(&d.encode_to_vec())).unwrap_or_default();
-        let inner = OutgoingRpcData { request_id: request_id.clone(), action: action as i32, unencrypted_proto_data: vec![], encrypted_proto_data: encrypted, session_id: self.session.session_id() };
+        let (tok, mobile, ttl, crypto, dest) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.mobile_device(), a.tachyon_ttl, a.request_crypto.clone(), a.dest_reg_id.clone()) };
+        let raw = data.map(|d| d.encode_to_vec());
+        let (unencrypted, encrypted) = match raw { None => (vec![], vec![]), Some(r) if opts.dont_encrypt => (r, vec![]), Some(r) => (vec![], crypto.encrypt(&r)) };
+        let inner = OutgoingRpcData { request_id: request_id.clone(), action: action as i32, unencrypted_proto_data: unencrypted, encrypted_proto_data: encrypted, session_id: self.session.session_id() };
         let msg = OutgoingRpcMessage {
             mobile,
             data: Some(outgoing_rpc_message::Data {
@@ -391,12 +427,12 @@ impl Client {
                 message_type_data: Some(outgoing_rpc_message::data::Type { empty_arr: Some(EmptyArr {}), message_type: opts.message_type as i32 }),
             }),
             auth: Some(outgoing_rpc_message::Auth { request_id: request_id.clone(), tachyon_auth_token: tok, config_version: Some(crate::gm::auth::config_version()) }),
-            ttl: if opts.omit_ttl { 0 } else { ttl },
-            dest_registration_i_ds: vec![],
+            ttl: opts.custom_ttl.unwrap_or(if opts.omit_ttl { 0 } else { ttl }),
+            dest_registration_i_ds: dest.into_iter().collect(),
         };
         let rx = if opts.expect_response { Some(self.session.wait_for(&request_id)) } else { None };
         tracing::debug!(?action, %request_id, "→ phone");
-        let sent: Result<OutgoingRpcResponse> = async { http::parse(http::post(&self.http, &http::url_send_message(), http::body_pblite(&msg)?).await?).await }.await;
+        let sent: Result<OutgoingRpcResponse> = async { http::parse(self.post(false, &http::url_send_message(self.is_google()), http::body_pblite(&msg)?).await?).await }.await;
         if let Err(e) = sent { self.session.cancel(&request_id); return Err(e); }
         let Some(rx) = rx else { return Ok(None) };
         match tokio::time::timeout(Duration::from_secs(60), rx).await {

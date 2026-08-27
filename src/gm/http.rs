@@ -18,9 +18,11 @@ const REGISTRATION: &str = "/$rpc/google.internal.communications.instantmessagin
 pub fn url_register_phone_relay() -> String { format!("{IM}{PAIRING}/RegisterPhoneRelay") }
 pub fn url_refresh_phone_relay() -> String { format!("{IM}{PAIRING}/RefreshPhoneRelay") }
 pub fn url_revoke_relay_pairing() -> String { format!("{IM}{PAIRING}/RevokeRelayPairing") }
-pub fn url_receive_messages() -> String { format!("{IM}{MESSAGING}/ReceiveMessages") }
-pub fn url_send_message() -> String { format!("{IM}{MESSAGING}/SendMessage") }
-pub fn url_ack_messages() -> String { format!("{IM}{MESSAGING}/AckMessages") }
+pub fn url_receive_messages(google: bool) -> String { format!("{}{MESSAGING}/ReceiveMessages", if google { IM_G } else { IM }) }
+pub fn url_send_message(google: bool) -> String { format!("{}{MESSAGING}/SendMessage", if google { IM_G } else { IM }) }
+pub fn url_ack_messages(google: bool) -> String { format!("{}{MESSAGING}/AckMessages", if google { IM_G } else { IM }) }
+pub fn url_sign_in_gaia() -> String { format!("{IM_G}{REGISTRATION}/SignInGaia") }
+pub const URL_CONFIG: &str = "https://messages.google.com/web/config";
 pub fn url_register_refresh() -> String { format!("{IM_G}{REGISTRATION}/RegisterRefresh") }
 pub fn url_upload_media() -> String { format!("{IM}/upload") }
 
@@ -58,13 +60,15 @@ pub enum Body { Proto(Vec<u8>), PbLite(Vec<u8>) }
 pub fn body_proto<M: Message>(m: &M) -> Body { Body::Proto(m.encode_to_vec()) }
 pub fn body_pblite<M: ReflectMessage>(m: &M) -> Result<Body> { Ok(Body::PbLite(crate::gm::pblite::encode(m)?)) }
 
-/// POST with retries on 5xx; returns raw response.
-pub async fn post(cli: &reqwest::Client, url: &str, body: Body) -> Result<reqwest::Response> {
+/// POST with retries on 5xx; returns raw response. `cookies` = (Cookie, Authorization) for Google-account sessions.
+pub async fn post(cli: &reqwest::Client, url: &str, body: Body, cookies: Option<(String, String)>) -> Result<reqwest::Response> {
     let (ct, bytes) = match body { Body::Proto(b) => (CT_PROTOBUF, b), Body::PbLite(b) => (CT_PBLITE, b) };
     let mut attempt = 0;
     loop {
         attempt += 1;
-        let resp = cli.post(url).headers(relay_headers(Some(ct))).body(bytes.clone()).send().await.with_context(|| format!("POST {url}"))?;
+        let mut req = cli.post(url).headers(relay_headers(Some(ct))).body(bytes.clone());
+        if let Some((c, a)) = &cookies { req = req.header("cookie", c).header("authorization", a); }
+        let resp = req.send().await.with_context(|| format!("POST {url}"))?;
         if resp.status().as_u16() < 500 || attempt >= 3 { return Ok(resp); }
         tracing::debug!(url, status = %resp.status(), attempt, "server error, retrying");
         tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;

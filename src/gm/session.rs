@@ -54,8 +54,11 @@ impl Session {
     pub fn cancel_all(&self) { self.waiters.lock().unwrap().clear(); }
 
     /// Route a frame to a waiting request. Returns true if consumed.
-    pub fn deliver(&self, msg: &Incoming) -> bool {
+    pub fn deliver(&self, msg: &Incoming, google: bool) -> bool {
         let Some(m) = &msg.message else { return false };
+        // Google-account sessions get odd unencrypted pre-responses before the real one; skip those.
+        let gaia_action = matches!(msg.action(), ActionType::CreateGaiaPairingClientInit | ActionType::CreateGaiaPairingClientFinished);
+        if google && !gaia_action && !m.unencrypted_data.is_empty() && m.encrypted_data.is_empty() { return false; }
         let tx = self.waiters.lock().unwrap().remove(&m.session_id);
         match tx { Some(tx) => { let _ = tx.send(msg.clone()); true } None => false }
     }
