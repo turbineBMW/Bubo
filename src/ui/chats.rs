@@ -16,7 +16,13 @@ struct State {
     messages: HashMap<String, Vec<Msg>>,
     current: Option<String>,
     rows: HashMap<String, gtk4::ListBoxRow>,
+    /// Pagination cursor for older messages per conversation. Absent key = never loaded;
+    /// `None` = history exhausted.
+    cursors: HashMap<String, Option<crate::gm::proto::client::Cursor>>,
+    loading_older: std::collections::HashSet<String>,
 }
+
+const PAGE: i64 = 50;
 
 pub struct ChatsView {
     pub widget: adw::NavigationSplitView,
@@ -122,6 +128,10 @@ impl ChatsView {
     }
 
     pub fn start(self: &Rc<Self>) {
+        {
+            let me = Rc::downgrade(self);
+            self.thread_scroll.vadjustment().connect_value_changed(move |_| { if let Some(me) = me.upgrade() { me.maybe_load_older(); } });
+        }
         // notification click → focus window and open that conversation
         let open = gtk4::gio::SimpleAction::new("open-conversation", Some(glib::VariantTy::STRING));
         let me = self.clone();
@@ -230,14 +240,15 @@ impl ChatsView {
             self.content_stack.set_visible_child_name("loading");
             let c = self.client.clone(); let id2 = id.to_string();
             let (tx, rx) = async_channel::bounded(1);
-            crate::rt::spawn(async move { let _ = tx.send(c.list_messages(&id2, 50, None).await).await; });
+            crate::rt::spawn(async move { let _ = tx.send(c.list_messages(&id2, PAGE, None).await).await; });
             let me = self.clone(); let id2 = id.to_string();
             glib::spawn_future_local(async move {
                 match rx.recv().await {
                     Ok(Ok(r)) => {
                         let mut msgs: Vec<Msg> = r.messages.iter().map(Msg::from_proto).collect();
                         msgs.sort_by_key(|m| m.ts);
-                        me.st.borrow_mut().messages.insert(id2.clone(), msgs);
+                        let more = (r.messages.len() as i64) >= PAGE;
+                        { let mut st = me.st.borrow_mut(); st.messages.insert(id2.clone(), msgs); st.cursors.insert(id2.clone(), r.cursor.filter(|_| more)); }
                         if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(); }
                     }
                     Ok(Err(e)) => {
@@ -274,10 +285,63 @@ impl ChatsView {
         let Some(msgs) = st.messages.get(cur) else { return };
         self.content_stack.set_visible_child_name("thread");
         let group = st.convs.iter().find(|c| &c.id == cur).map(|c| c.is_group).unwrap_or(false);
+        if st.cursors.get(cur).map(|c| c.is_some()).unwrap_or(false) {
+            let spinner = adw::Spinner::builder().width_request(24).height_request(24).margin_top(8).margin_bottom(8).halign(gtk4::Align::Center).build();
+            self.thread.append(&gtk4::ListBoxRow::builder().child(&spinner).activatable(false).selectable(false).build());
+        }
         for m in msgs { self.thread.append(&self.bubble(m, group)); }
         drop(st);
         let sw = self.thread_scroll.clone();
         glib::idle_add_local_once(move || { let adj = sw.vadjustment(); adj.set_value(adj.upper() - adj.page_size()); });
+    }
+
+    /// Called on every scroll: when the top of the thread comes within a screen of view, fetch
+    /// the next page of older messages and prepend them without moving what the user is looking at.
+    fn maybe_load_older(self: &Rc<Self>) {
+        let adj = self.thread_scroll.vadjustment();
+        if adj.value() > adj.page_size() { return; }
+        let (id, cursor) = {
+            let mut st = self.st.borrow_mut();
+            let Some(id) = st.current.clone() else { return };
+            let Some(Some(cursor)) = st.cursors.get(&id).cloned() else { return };
+            if !st.loading_older.insert(id.clone()) { return; }
+            (id, cursor)
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        let (c, id2) = (self.client.clone(), id.clone());
+        crate::rt::spawn(async move { let _ = tx.send(c.list_messages(&id2, PAGE, Some(cursor)).await).await; });
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            let r = rx.recv().await;
+            me.st.borrow_mut().loading_older.remove(&id);
+            match r {
+                Ok(Ok(r)) => {
+                    let more = (r.messages.len() as i64) >= PAGE;
+                    let added = {
+                        let mut st = me.st.borrow_mut();
+                        st.cursors.insert(id.clone(), r.cursor.filter(|_| more));
+                        let list = st.messages.entry(id.clone()).or_default();
+                        let before = list.len();
+                        for m in r.messages.iter().map(Msg::from_proto) { if !list.iter().any(|x| x.id == m.id) { list.push(m); } }
+                        list.sort_by_key(|m| m.ts);
+                        list.len() - before
+                    };
+                    if me.st.borrow().current.as_deref() != Some(&id) { return; }
+                    if added == 0 && !more { me.render_thread(); return; }
+                    // Preserve the visual position: keep the distance from the bottom constant.
+                    let adj = me.thread_scroll.vadjustment();
+                    let from_bottom = adj.upper() - adj.value();
+                    me.render_thread();
+                    let sw = me.thread_scroll.clone();
+                    glib::idle_add_local_once(move || { let adj = sw.vadjustment(); adj.set_value(adj.upper() - from_bottom); });
+                    // If the page was short enough that the top is still visible, keep going.
+                    let me2 = me.clone();
+                    glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || me2.maybe_load_older());
+                }
+                Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Could not load older messages: {e:#}"))),
+                Err(_) => {}
+            }
+        });
     }
 
     fn send_current(self: &Rc<Self>) {
