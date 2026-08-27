@@ -24,6 +24,7 @@ pub fn url_ack_messages(google: bool) -> String { format!("{}{MESSAGING}/AckMess
 pub fn url_sign_in_gaia() -> String { format!("{IM_G}{REGISTRATION}/SignInGaia") }
 pub const URL_CONFIG: &str = "https://messages.google.com/web/config";
 pub fn url_register_refresh() -> String { format!("{IM_G}{REGISTRATION}/RegisterRefresh") }
+#[allow(dead_code)]
 pub fn url_upload_media() -> String { format!("{IM}/upload") }
 
 pub const CT_PROTOBUF: &str = "application/x-protobuf";

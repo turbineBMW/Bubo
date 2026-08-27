@@ -41,8 +41,9 @@ impl LoginPage {
             let (done, on_cookies) = (done.clone(), on_cookies.clone());
             move |wv: &webkit6::WebView, map: std::collections::HashMap<String, String>| {
                 if done.replace(true) { return; }
-                wv.stop_loading(); wv.load_uri("about:blank");
-                on_cookies(map);
+                let wv = wv.clone();
+                // Leave WebKit's callback first; then blank the view and hand the cookies over.
+                gtk4::glib::idle_add_local_once(move || { wv.stop_loading(); wv.load_uri("about:blank"); on_cookies(map); });
             }
         };
         let is_app_url = |u: &str| u.starts_with("https://messages.google.com/web") && !u.starts_with("https://messages.google.com/web/authentication");
@@ -95,7 +96,7 @@ impl EmojiPage {
 }
 
 /// Run both pairing phases on tokio; results come back on `tx`.
-pub enum PairProgress { Emoji(String), Done(String), Failed(String) }
+pub enum PairProgress { Emoji(String), Done, Failed(String) }
 
 pub fn run_gaia_pairing(client: Arc<Client>, tx: async_channel::Sender<PairProgress>) {
     crate::rt::spawn(async move {
@@ -104,7 +105,7 @@ pub fn run_gaia_pairing(client: Arc<Client>, tx: async_channel::Sender<PairProgr
             Ok((emoji, ps)) => {
                 let _ = tx.send(PairProgress::Emoji(emoji)).await;
                 match client.finish_gaia_pairing(ps).await {
-                    Ok(id) => { let _ = tx.send(PairProgress::Done(id)).await; }
+                    Ok(_) => { let _ = tx.send(PairProgress::Done).await; }
                     Err(e) => { let _ = tx.send(PairProgress::Failed(format!("{e:#}"))).await; }
                 }
             }

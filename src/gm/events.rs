@@ -2,6 +2,7 @@
 use crate::gm::proto::{conversations, events, settings};
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub enum Event {
     /// QR was scanned and the phone accepted us.
     Paired { phone_id: String },

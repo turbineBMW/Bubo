@@ -32,7 +32,9 @@ fn start_pairing(win: &adw::ApplicationWindow, stack: &gtk4::Stack) {
             tracing::info!("got Google session cookies");
             client.auth.lock().unwrap().cookies = cookies;
             stack.set_visible_child_name("emoji");
-            if let Some(w) = stack.child_by_name("login") { stack.remove(&w); } // tear the WebView down for good
+            // Tear the WebView down — but not from inside its own callback, or WebKit segfaults.
+            let stack2 = stack.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || { if let Some(w) = stack2.child_by_name("login") { stack2.remove(&w); } });
             login::run_gaia_pairing(client.clone(), ptx.clone());
         }
     });
@@ -44,7 +46,7 @@ fn start_pairing(win: &adw::ApplicationWindow, stack: &gtk4::Stack) {
         while let Ok(p) = prx.recv().await {
             match p {
                 login::PairProgress::Emoji(e) => ep.show_emoji(&e),
-                login::PairProgress::Done(_) => ep.paired(),
+                login::PairProgress::Done => ep.paired(),
                 login::PairProgress::Failed(e) => ep.error(&e),
             }
         }
