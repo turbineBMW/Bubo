@@ -115,7 +115,7 @@ impl ChatsView {
             .bubo-thread row { background: transparent; border: none; box-shadow: none; padding: 0; margin: 2px 0; }
             .bubo-meta { font-size: 0.8em; opacity: 0.7; }
             .bubo-snippet { opacity: 0.7; }
-            .bubo-convs row { padding: 6px 6px; }
+            .bubo-convs row { padding: 10px 10px; }
             .bubo-badge { background: var(--accent-bg-color); color: var(--accent-fg-color); border-radius: 999px;
                           min-width: 8px; min-height: 8px; padding: 2px; font-size: 0.65em; font-weight: bold;
                           border: 2px solid var(--window-bg-color); margin: -2px; }
