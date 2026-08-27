@@ -286,26 +286,31 @@ impl ChatsView {
         self.side_stack.set_visible_child_name(if convs.is_empty() { "empty" } else { "list" });
     }
 
-    /// Ask the phone for contact photos of every participant we haven't resolved yet, in one
-    /// batched RPC, and refresh the list when they land. Photos are cached on disk so a restart
-    /// doesn't round-trip through the phone again.
+    /// Ask the phone for contact photos of every conversation participant we haven't resolved
+    /// yet, and refresh the list when they land.
     fn fetch_avatars(self: &Rc<Self>) {
+        let ids: Vec<String> = self.st.borrow().convs.iter().flat_map(|c| c.participant_ids.iter().cloned()).collect();
+        let me = Rc::downgrade(self);
+        self.request_avatars(ids, move || { if let Some(me) = me.upgrade() { me.refresh_avatars_in_place(); } });
+    }
+
+    /// Resolve photos for `ids` — from the on-disk cache where possible, otherwise from the phone
+    /// in batched RPCs — and call `on_done` once anything new is available. Ids already cached or
+    /// in flight are skipped, so calling this repeatedly is cheap.
+    fn request_avatars(self: &Rc<Self>, ids: Vec<String>, on_done: impl Fn() + 'static) {
         let mut wanted: Vec<String> = Vec::new();
         {
-            let st = self.st.borrow();
             let mut cache = self.avatars.borrow_mut();
-            for c in &st.convs {
-                for p in &c.participant_ids {
-                    if cache.contains_key(p) || wanted.contains(p) { continue; }
-                    match load_cached_avatar(p) {
-                        Some(tex) => { cache.insert(p.clone(), Some(tex)); }
-                        None => wanted.push(p.clone()),
-                    }
+            for p in ids {
+                if p.is_empty() || cache.contains_key(&p) || wanted.contains(&p) { continue; }
+                match load_cached_avatar(&p) {
+                    Some(tex) => { cache.insert(p, Some(tex)); }
+                    None => wanted.push(p),
                 }
             }
         }
-        // Rows were built before the disk hits above were loaded, so always apply them now.
-        self.refresh_avatars_in_place();
+        // Callers built their rows before the disk hits above were loaded, so always apply them now.
+        on_done();
         if wanted.is_empty() { return; }
         let mut pending = self.avatars.borrow_mut();
         for p in &wanted { pending.insert(p.clone(), None); } // mark in-flight; overwritten on reply
@@ -334,7 +339,7 @@ impl ChatsView {
                     Err(e) => tracing::warn!("avatar {id}: undecodable image: {e}"),
                 }
             }
-            if any { me.refresh_avatars_in_place(); }
+            if any { on_done(); }
         });
     }
 
@@ -650,10 +655,40 @@ impl ChatsView {
                 let av = adw::Avatar::new(32, Some(&c.name), true);
                 if let Some(Some(tex)) = avatars.get(&c.participant_id) { av.set_custom_image(Some(tex)); }
                 row.add_prefix(&av);
-                unsafe { row.set_data("number", c.number.clone()); }
+                unsafe { row.set_data("number", c.number.clone()); row.set_data("pid", c.participant_id.clone()); }
                 list2.append(&row); n += 1;
             }
             pages2.set_visible_child_name(if n == 0 { "empty" } else { "list" });
+        });
+
+        // Photos: fetch any the visible rows lack, and paint them onto those rows as they land
+        // (without rebuilding, so the user's place in the list holds).
+        let me_w = Rc::downgrade(self);
+        let l = list.clone();
+        let paint: Rc<dyn Fn()> = Rc::new(move || {
+            let Some(me) = me_w.upgrade() else { return };
+            let avatars = me.avatars.borrow();
+            let mut i = 0;
+            while let Some(row) = l.row_at_index(i) {
+                i += 1;
+                let Some(pid) = (unsafe { row.data::<String>("pid").map(|p| p.as_ref().clone()) }) else { continue };
+                let Some(Some(tex)) = avatars.get(&pid) else { continue };
+                if let Some(av) = find_avatar(row.upcast_ref()) { av.set_custom_image(Some(tex)); }
+            }
+        });
+        let (me_w, l, p) = (Rc::downgrade(self), list.clone(), paint.clone());
+        let fill_inner = fill;
+        let fill: Rc<dyn Fn(&str)> = Rc::new(move |q: &str| {
+            fill_inner(q);
+            let Some(me) = me_w.upgrade() else { return };
+            let mut ids = Vec::new();
+            let mut i = 0;
+            while let Some(row) = l.row_at_index(i) {
+                i += 1;
+                if let Some(pid) = unsafe { row.data::<String>("pid").map(|p| p.as_ref().clone()) } { ids.push(pid); }
+            }
+            let p = p.clone();
+            me.request_avatars(ids, move || p());
         });
 
         let f = fill.clone();
