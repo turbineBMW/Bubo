@@ -20,7 +20,7 @@ out of a UKEY2 handshake between Bubo and the phone. (Google retired QR pairing 
   - `client.rs`     — token refresh, long-poll stream, typed RPCs, QR pairing
   - `gaia.rs`       — Google-account pairing: SignInGaia + UKEY2 (P-256 ECDH, HKDF) + emoji
   - `session.rs`    — request/response correlation and message acks
-- `src/ui/`         — libadwaita UI: WebKit Google sign-in, emoji page, chat list, thread, composer
+- `src/ui/`         — libadwaita UI: WebKit Google sign-in, emoji page, chat list, thread, composer, attachments
 
 ## Running
 
@@ -74,9 +74,9 @@ Google-account (emoji) pairing and message sync verified live end-to-end 2026-08
 
 - [x] Google-account (emoji) pairing, legacy QR pairing, token refresh, stream, acks, liveness pings
 - [x] Conversation list, message history, send text, read receipts, typing
-- [ ] Media (download/upload — needs the AES-GCM chunked scheme in `media.go`)
+- [x] Desktop notifications (click to open the conversation)
+- [x] Media: view inbound images inline, download files, send images/files (AES-GCM chunked)
 - [ ] Reactions, replies, contacts / new conversation UI
-- [ ] Desktop notifications
 
 ## Licence
 

@@ -1,5 +1,5 @@
 //! Conversation list + message thread + composer.
-use super::state::{Conv, Msg, fmt_time};
+use super::state::{Conv, Media, Msg, fmt_time};
 use crate::gm::client::Client;
 use crate::gm::events::Event;
 use crate::gm::proto::client::list_conversations_request::Folder;
@@ -30,6 +30,7 @@ pub struct ChatsView {
     thread_title: adw::WindowTitle,
     entry: gtk4::Entry,
     send: gtk4::Button,
+    attach: gtk4::Button,
     toast: adw::ToastOverlay,
     banner: adw::Banner,
 }
@@ -55,8 +56,9 @@ impl ChatsView {
         let thread_title = adw::WindowTitle::new("", "");
         let entry = gtk4::Entry::builder().placeholder_text("Message").hexpand(true).build();
         let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).build();
+        let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").build();
         let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).build();
-        composer.append(&entry); composer.append(&send);
+        composer.append(&attach); composer.append(&entry); composer.append(&send);
         let banner = adw::Banner::builder().revealed(false).build();
         let content_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         content_box.append(&banner); content_box.append(&thread_scroll); content_box.append(&composer);
@@ -79,7 +81,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, toast, banner };
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, attach, toast, banner };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -113,6 +115,8 @@ impl ChatsView {
         self.entry.connect_activate(move |_| me.send_current());
         let me = self.clone();
         self.send.connect_clicked(move |_| me.send_current());
+        let me = self.clone();
+        self.attach.connect_clicked(move |_| me.pick_and_send());
         // typing indicator: notify the phone (throttled) while the user types
         let me = self.clone();
         let last = Rc::new(RefCell::new(std::time::Instant::now() - std::time::Duration::from_secs(10)));
@@ -217,7 +221,7 @@ impl ChatsView {
         }
     }
 
-    fn push_message(&self, m: Msg) {
+    fn push_message(self: &Rc<Self>, m: Msg) {
         let conv_id = m.conversation_id.clone();
         {
             let mut st = self.st.borrow_mut();
@@ -228,13 +232,13 @@ impl ChatsView {
         if self.st.borrow().current.as_deref() == Some(&conv_id) { self.render_thread(); }
     }
 
-    fn render_thread(&self) {
+    fn render_thread(self: &Rc<Self>) {
         while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
         let st = self.st.borrow();
         let Some(cur) = &st.current else { return };
         let Some(msgs) = st.messages.get(cur) else { return };
         let group = st.convs.iter().find(|c| &c.id == cur).map(|c| c.is_group).unwrap_or(false);
-        for m in msgs { self.thread.append(&bubble(m, group)); }
+        for m in msgs { self.thread.append(&self.bubble(m, group)); }
         drop(st);
         let sw = self.thread_scroll.clone();
         glib::idle_add_local_once(move || { let adj = sw.vadjustment(); adj.set_value(adj.upper() - adj.page_size()); });
@@ -263,6 +267,41 @@ impl ChatsView {
 }
 
 impl ChatsView {
+    /// Open a file chooser, upload the chosen file, and send it to the open conversation.
+    fn pick_and_send(self: &Rc<Self>) {
+        let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
+        let Some(conv) = conv else { return };
+        let dialog = gtk4::FileDialog::builder().title("Send a file").build();
+        let me = self.clone();
+        let win = me.win.clone();
+        dialog.open(Some(&win), None::<&gtk4::gio::Cancellable>, move |res| {
+            let Ok(file) = res else { return };
+            let Some(path) = file.path() else { return };
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+            let data = match std::fs::read(&path) { Ok(d) => d, Err(e) => { me.toast.add_toast(adw::Toast::new(&format!("Could not read file: {e}"))); return; } };
+            let mime = gtk4::gio::content_type_guess(Some(&name), Some(data.as_slice())).0.to_string();
+            me.toast.add_toast(adw::Toast::new(&format!("Sending {name}…")));
+            let (tx, rx) = async_channel::bounded(1);
+            let (c, cid, pid, caption) = (me.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), me.entry.text().to_string());
+            crate::rt::spawn(async move {
+                let r = match c.upload_media(&data, &name, &mime).await {
+                    Ok(media) => c.send_media(&cid, &pid, media, &caption, None).await.map(|_| ()),
+                    Err(e) => Err(e),
+                };
+                let _ = tx.send(r).await;
+            });
+            me.entry.set_text("");
+            let me2 = me.clone();
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => me2.toast.add_toast(adw::Toast::new(&format!("Send failed: {e:#}"))),
+                    Err(_) => {}
+                }
+            });
+        });
+    }
+
     /// Desktop notification for an inbound message, unless it's ours, backfill, or the
     /// conversation is already open in a focused window.
     fn maybe_notify(&self, m: &Msg, is_old: bool) {
@@ -308,19 +347,78 @@ fn conv_row(c: &Conv) -> gtk4::ListBoxRow {
     row
 }
 
-fn bubble(m: &Msg, group: bool) -> gtk4::ListBoxRow {
-    let mut body = m.text.clone();
-    for md in &m.media { if !body.is_empty() { body.push('\n'); } body.push_str(&format!("📎 {md}")); }
-    let label = gtk4::Label::builder().label(&body).wrap(true).wrap_mode(gtk4::pango::WrapMode::WordChar).xalign(0.0).selectable(true).max_width_chars(60).build();
-    let bubble = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(2).css_classes(["bubo-bubble", if m.from_me { "bubo-me" } else { "bubo-them" }]).build();
+impl ChatsView {
+    fn bubble(self: &Rc<Self>, m: &Msg, group: bool) -> gtk4::ListBoxRow {
+    let bubble = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).css_classes(["bubo-bubble", if m.from_me { "bubo-me" } else { "bubo-them" }]).build();
     if group && !m.from_me && !m.sender.is_empty() {
         bubble.append(&gtk4::Label::builder().label(&m.sender).xalign(0.0).css_classes(["caption", "heading"]).build());
     }
-    bubble.append(&label);
+    for md in &m.media { bubble.append(&self.attachment_widget(md)); }
+    if !m.text.trim().is_empty() {
+        bubble.append(&gtk4::Label::builder().label(&m.text).wrap(true).wrap_mode(gtk4::pango::WrapMode::WordChar).xalign(0.0).selectable(true).max_width_chars(60).build());
+    }
     let mut meta = fmt_time(m.ts);
     if m.from_me { meta.push_str(match m.status { 1 | 2 | 3 | 4 | 5 | 6 => " · sent", 11 => " · delivered", 12 => " · read", s if s >= 100 => " · failed", _ => "" }); }
     let meta = gtk4::Label::builder().label(&meta).css_classes(["bubo-meta"]).halign(if m.from_me { gtk4::Align::End } else { gtk4::Align::Start }).build();
     let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(1).halign(if m.from_me { gtk4::Align::End } else { gtk4::Align::Start }).build();
     col.append(&bubble); col.append(&meta);
     gtk4::ListBoxRow::builder().child(&col).activatable(false).selectable(false).build()
+    }
+
+    /// A clickable attachment: images load inline on click; other files save to ~/Downloads.
+    fn attachment_widget(self: &Rc<Self>, md: &Media) -> gtk4::Widget {
+        let icon = if md.is_image() { "🖼" } else { "📎" };
+        let btn = gtk4::Button::builder().label(&format!("{icon} {}", md.label())).css_classes(["flat"]).halign(gtk4::Align::Start).build();
+        let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        holder.append(&btn);
+        let (me, md, holder2, btn2) = (self.clone(), md.clone(), holder.clone(), btn.clone());
+        btn.connect_clicked(move |_| {
+            btn2.set_sensitive(false);
+            btn2.set_label(&format!("⏳ {}", md.label()));
+            let (tx, rx) = async_channel::bounded(1);
+            let (c, id, key) = (me.client.clone(), md.id.clone(), md.key.clone());
+            crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
+            let (me, md, holder2, btn2) = (me.clone(), md.clone(), holder2.clone(), btn2.clone());
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(bytes)) => {
+                        if md.is_image() {
+                            match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+                                Ok(tex) => {
+                                    let pic = gtk4::Picture::for_paintable(&tex);
+                                    pic.set_can_shrink(true);
+                                    pic.set_content_fit(gtk4::ContentFit::ScaleDown);
+                                    pic.set_size_request(-1, 240);
+                                    pic.set_halign(gtk4::Align::Start);
+                                    holder2.remove(&btn2);
+                                    holder2.append(&pic);
+                                }
+                                Err(e) => { btn2.set_sensitive(true); btn2.set_label(&format!("🖼 {}", md.label())); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
+                            }
+                        } else {
+                            match save_download(&md, &bytes) {
+                                Ok(path) => { btn2.set_label(&format!("✓ {}", md.label())); me.toast.add_toast(adw::Toast::new(&format!("Saved to {}", path.display()))); }
+                                Err(e) => { btn2.set_sensitive(true); btn2.set_label(&format!("📎 {}", md.label())); me.toast.add_toast(adw::Toast::new(&format!("Save failed: {e}"))); }
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => { btn2.set_sensitive(true); btn2.set_label(&format!("{} {}", if md.is_image() { "🖼" } else { "📎" }, md.label())); me.toast.add_toast(adw::Toast::new(&format!("Download failed: {e:#}"))); }
+                    Err(_) => {}
+                }
+            });
+        });
+        holder.upcast()
+    }
+}
+
+fn save_download(md: &Media, bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {
+    let dir = directories::UserDirs::new().and_then(|d| d.download_dir().map(|p| p.to_path_buf())).unwrap_or_else(|| std::path::PathBuf::from("."));
+    std::fs::create_dir_all(&dir)?;
+    let name = if md.name.is_empty() { format!("bubo-{}", &md.id[..md.id.len().min(8)]) } else { md.name.clone() };
+    let mut path = dir.join(&name);
+    let (stem, ext) = match name.rsplit_once('.') { Some((s, e)) => (s.to_string(), format!(".{e}")), None => (name.clone(), String::new()) };
+    let mut n = 1;
+    while path.exists() { path = dir.join(format!("{stem} ({n}){ext}")); n += 1; }
+    std::fs::write(&path, bytes)?;
+    Ok(path)
 }

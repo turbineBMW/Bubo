@@ -84,6 +84,69 @@ pub fn rand_core06() -> impl p256::elliptic_curve::rand_core::CryptoRngCore {
     Os
 }
 
+/// Google's chunked AES-256-GCM media format: header `[0, 15]` then 32 KiB chunks, each
+/// `nonce(12) ‖ ciphertext ‖ tag(16)`, with 5-byte AAD `[isLast][be32 index]`.
+pub struct MediaCrypto { key: [u8; 32] }
+
+impl MediaCrypto {
+    const CHUNK: usize = 1 << 15; // 32768
+    const OVERHEAD: usize = 12 + 16;
+
+    pub fn new(key: &[u8]) -> Result<Self> {
+        Ok(Self { key: <[u8; 32]>::try_from(key).map_err(|_| anyhow::anyhow!("media key must be 32 bytes, got {}", key.len()))? })
+    }
+    pub fn generate() -> (Self, Vec<u8>) { let k = random(32); (Self { key: k.clone().try_into().unwrap() }, k) }
+
+    fn aad(index: u32, last: bool) -> [u8; 5] {
+        let mut a = [0u8; 5];
+        a[0] = last as u8;
+        a[1..].copy_from_slice(&index.to_be_bytes());
+        a
+    }
+
+    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, Payload}};
+        let gcm = Aes256Gcm::new(self.key.as_slice().into());
+        let mut out = vec![0u8, 15];
+        let step = Self::CHUNK - Self::OVERHEAD;
+        let mut index = 0u32;
+        let mut i = 0;
+        while i < data.len() || (data.is_empty() && index == 0 && false) {
+            let end = (i + step).min(data.len());
+            let last = end == data.len();
+            let nonce = random(12);
+            let ct = gcm.encrypt(nonce.as_slice().into(), Payload { msg: &data[i..end], aad: &Self::aad(index, last) }).map_err(|_| anyhow::anyhow!("media encrypt failed"))?;
+            out.extend_from_slice(&nonce);
+            out.extend_from_slice(&ct);
+            index += 1;
+            i = end;
+        }
+        Ok(out)
+    }
+
+    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>> {
+        use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, Payload}};
+        if data.is_empty() { return Ok(vec![]); }
+        if data[0] != 0 { bail!("media: bad header byte {}", data[0]); }
+        let chunk = 1usize << data[1];
+        let body = &data[2..];
+        let gcm = Aes256Gcm::new(self.key.as_slice().into());
+        let mut out = Vec::with_capacity(body.len());
+        let mut index = 0u32;
+        let mut i = 0;
+        while i < body.len() {
+            let end = (i + chunk).min(body.len());
+            let last = end == body.len();
+            let (nonce, ct) = body[i..end].split_at(12);
+            let pt = gcm.decrypt(nonce.into(), Payload { msg: ct, aad: &Self::aad(index, last) }).map_err(|_| anyhow::anyhow!("media chunk {index} decrypt failed"))?;
+            out.extend_from_slice(&pt);
+            index += 1;
+            i = end;
+        }
+        Ok(out)
+    }
+}
+
 pub mod b64 {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use serde::{Deserialize, Deserializer, Serializer};
@@ -103,6 +166,16 @@ mod tests {
         assert_eq!(c.decrypt(&ct).unwrap(), b"hello owl");
         let mut bad = ct.clone(); bad[0] ^= 1;
         assert!(c.decrypt(&bad).is_err());
+    }
+    #[test]
+    fn media_roundtrip() {
+        let (mc, key) = MediaCrypto::generate();
+        for size in [0usize, 10, 32740, 32741, 100_000] {
+            let data: Vec<u8> = (0..size).map(|i| (i * 7) as u8).collect();
+            let ct = mc.encrypt(&data).unwrap();
+            let mc2 = MediaCrypto::new(&key).unwrap();
+            assert_eq!(mc2.decrypt(&ct).unwrap(), data, "size {size}");
+        }
     }
     #[test]
     fn keys() {

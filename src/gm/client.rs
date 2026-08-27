@@ -485,6 +485,21 @@ impl Client {
         };
         self.call(ActionType::SendMessage, req, true).await
     }
+    /// Send an already-uploaded attachment (optionally with a caption) to a conversation.
+    pub async fn send_media(&self, conversation_id: &str, participant_id: &str, media: conversations::MediaContent, caption: &str, sim: Option<settings::SimPayload>) -> Result<SendMessageResponse> {
+        let tmp = uuid::Uuid::new_v4().to_string();
+        let mut info = vec![conversations::MessageInfo { action_message_id: None, data: Some(conversations::message_info::Data::MediaContent(media)) }];
+        if !caption.is_empty() {
+            info.push(conversations::MessageInfo { action_message_id: None, data: Some(conversations::message_info::Data::MessageContent(conversations::MessageContent { content: caption.into() })) });
+        }
+        let req = SendMessageRequest {
+            conversation_id: conversation_id.into(),
+            message_payload: Some(MessagePayload { tmp_id: tmp.clone(), conversation_id: conversation_id.into(), participant_id: participant_id.into(), tmp_id2: tmp.clone(), message_payload_content: None, message_info: info }),
+            sim_payload: sim, tmp_id: tmp, force_rcs: false, reply: None,
+        };
+        self.call(ActionType::SendMessage, req, true).await
+    }
+
     pub async fn mark_read(&self, conversation_id: &str, message_id: &str) -> Result<()> {
         self.send_rpc(ActionType::MessageRead, Some(MessageReadRequest { conversation_id: conversation_id.into(), message_id: message_id.into() }), SendOpts::default()).await.map(|_| ())
     }
@@ -502,6 +517,50 @@ impl Client {
         let req = GetOrCreateConversationRequest { numbers: numbers.iter().map(|n| conversations::ContactNumber { mysterious_int: 2, number: n.clone(), number2: n.clone(), ..Default::default() }).collect(), ..Default::default() };
         self.call(ActionType::GetOrCreateConversation, req, true).await
     }
+    // ───────────────────────────── media ─────────────────────────────
+
+    /// Download an attachment and decrypt it with its per-message key.
+    pub async fn download_media(&self, attachment_id: &str, key: &[u8]) -> Result<Vec<u8>> {
+        let (tok, net) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.network()) };
+        let req = DownloadAttachmentRequest {
+            info: Some(AttachmentInfo { attachment_id: attachment_id.into(), encrypted: true }),
+            auth_data: Some(auth_message(uuid::Uuid::new_v4().to_string(), &tok, net)),
+        };
+        let metadata = B64.encode(req.encode_to_vec());
+        let resp = self.http.get(http::url_upload_media()).headers(http::download_headers(&metadata)).send().await?;
+        if !resp.status().is_success() { bail!("media download HTTP {}", resp.status()); }
+        let body = resp.bytes().await?;
+        crate::gm::crypto::MediaCrypto::new(key)?.decrypt(&body)
+    }
+
+    /// Encrypt and upload a file; returns a `MediaContent` ready to attach to a message.
+    pub async fn upload_media(&self, data: &[u8], file_name: &str, mime: &str) -> Result<conversations::MediaContent> {
+        let (mc, key) = crate::gm::crypto::MediaCrypto::generate();
+        let enc = mc.encrypt(data)?;
+        // start (resumable)
+        let (tok, net, mobile) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.network(), a.mobile_device()) };
+        let start_req = StartMediaUploadRequest { attachment_type: 1, auth_data: Some(auth_message(uuid::Uuid::new_v4().to_string(), &tok, net)), mobile };
+        let payload = B64.encode(start_req.encode_to_vec());
+        let start = self.http.post(http::url_upload_media()).headers(http::upload_headers(enc.len(), "start", None, mime, Some("resumable"))).body(payload).send().await?;
+        if !start.status().is_success() { bail!("upload start HTTP {}", start.status()); }
+        let upload_url = start.headers().get("x-goog-upload-url").and_then(|v| v.to_str().ok()).ok_or_else(|| anyhow!("no upload URL"))?.to_string();
+        // finalize (single chunk)
+        let fin = self.http.post(&upload_url).headers(http::upload_headers(enc.len(), "upload, finalize", Some(0), mime, None)).body(enc.clone()).send().await?;
+        if !fin.status().is_success() { bail!("upload finalize HTTP {}", fin.status()); }
+        let mut raw = fin.bytes().await?.to_vec();
+        // response may be base64
+        if raw.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'+' || c == b'/' || c == b'=') && raw.len() % 4 == 0 {
+            if let Ok(dec) = B64.decode(&raw) { raw = dec; }
+        }
+        let resp = UploadMediaResponse::decode(raw.as_slice())?;
+        let media = resp.media.ok_or_else(|| anyhow!("no media in upload response"))?;
+        let mt = media_format_for_mime(mime);
+        Ok(conversations::MediaContent {
+            format: mt as i32, media_id: media.media_id, media_name: file_name.into(), size: data.len() as i64,
+            decryption_key: key, mime_type: mime.into(), ..Default::default()
+        })
+    }
+
     pub async fn is_bugle_default(&self) -> Result<bool> {
         Ok(self.call::<_, IsBugleDefaultResponse>(ActionType::IsBugleDefault, EmptyArr {}, false).await?.success)
     }
@@ -522,6 +581,21 @@ mod stream_tests {
             i += n;
         }
         assert_eq!(frames, vec!["[null,null,null,[0]]", "[null,null,[]]", r#"[null,["id",19]]"#]);
+    }
+}
+
+/// Best-effort MediaFormats for a MIME type (covers the common cases; unknowns → *_UNSPECIFIED).
+fn media_format_for_mime(mime: &str) -> conversations::MediaFormats {
+    use conversations::MediaFormats as F;
+    match mime {
+        "image/jpeg" => F::ImageJpeg, "image/jpg" => F::ImageJpg, "image/png" => F::ImagePng,
+        "image/gif" => F::ImageGif, "image/bmp" | "image/x-ms-bmp" => F::ImageXMsBmp,
+        "video/mp4" => F::VideoMp4, "video/webm" => F::VideoWebm, "video/3gpp" => F::Video3gpp,
+        "audio/aac" => F::AudioAac, "audio/mp3" => F::AudioMp3, "audio/mpeg" => F::AudioMpeg, "audio/ogg" => F::AudioOgg,
+        "application/pdf" => F::AppPdf, "text/vcard" => F::TextVcard, "text/calendar" => F::CalTextCalendar,
+        m => match m.split('/').next().unwrap_or("") {
+            "image" => F::ImageUnspecified, "video" => F::VideoUnspecified, "audio" => F::AudioUnspecified, _ => F::AppUnspecified,
+        },
     }
 }
 

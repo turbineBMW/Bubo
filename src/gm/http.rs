@@ -27,6 +27,49 @@ pub fn url_register_refresh() -> String { format!("{IM_G}{REGISTRATION}/Register
 #[allow(dead_code)]
 pub fn url_upload_media() -> String { format!("{IM}/upload") }
 
+/// Headers for a media download GET (metadata carries the auth token).
+pub fn download_headers(metadata: &str) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    let set = |h: &mut HeaderMap, k: &'static str, v: &str| { h.insert(k, v.parse().unwrap()); };
+    set(&mut h, "x-goog-download-metadata", metadata);
+    set(&mut h, "sec-ch-ua", SEC_UA);
+    set(&mut h, "sec-ch-ua-mobile", "?1");
+    set(&mut h, "user-agent", USER_AGENT);
+    set(&mut h, "sec-ch-ua-platform", "\"Android\"");
+    set(&mut h, "accept", "*/*");
+    set(&mut h, "origin", "https://messages.google.com");
+    set(&mut h, "sec-fetch-site", "cross-site");
+    set(&mut h, "sec-fetch-mode", "cors");
+    set(&mut h, "sec-fetch-dest", "empty");
+    set(&mut h, "referer", "https://messages.google.com/");
+    set(&mut h, "accept-language", "en-US,en;q=0.9");
+    h
+}
+
+/// Headers for a resumable media upload POST.
+pub fn upload_headers(size: usize, command: &str, offset: Option<usize>, mime: &str, protocol: Option<&str>) -> HeaderMap {
+    let mut h = HeaderMap::new();
+    let set = |h: &mut HeaderMap, k: &'static str, v: &str| { h.insert(k, v.parse().unwrap()); };
+    set(&mut h, "sec-ch-ua", SEC_UA);
+    if let Some(p) = protocol { set(&mut h, "x-goog-upload-protocol", p); }
+    set(&mut h, "x-goog-upload-header-content-length", &size.to_string());
+    set(&mut h, "sec-ch-ua-mobile", "?1");
+    set(&mut h, "user-agent", USER_AGENT);
+    if !mime.is_empty() { set(&mut h, "x-goog-upload-header-content-type", mime); }
+    set(&mut h, "content-type", "application/x-www-form-urlencoded;charset=UTF-8");
+    set(&mut h, "x-goog-upload-command", command);
+    if let Some(o) = offset { set(&mut h, "x-goog-upload-offset", &o.to_string()); }
+    set(&mut h, "sec-ch-ua-platform", "\"Android\"");
+    set(&mut h, "accept", "*/*");
+    set(&mut h, "origin", "https://messages.google.com");
+    set(&mut h, "sec-fetch-site", "cross-site");
+    set(&mut h, "sec-fetch-mode", "cors");
+    set(&mut h, "sec-fetch-dest", "empty");
+    set(&mut h, "referer", "https://messages.google.com/");
+    set(&mut h, "accept-language", "en-US,en;q=0.9");
+    h
+}
+
 pub const CT_PROTOBUF: &str = "application/x-protobuf";
 pub const CT_PBLITE: &str = "application/json+protobuf";
 

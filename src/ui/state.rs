@@ -9,7 +9,7 @@ pub struct Msg {
     pub from_me: bool,
     pub sender: String,
     pub text: String,
-    pub media: Vec<String>,
+    pub media: Vec<Media>,
     /// Microseconds since epoch.
     pub ts: i64,
     pub status: i32,
@@ -21,7 +21,7 @@ impl Msg {
         for i in &m.message_info {
             match &i.data {
                 Some(message_info::Data::MessageContent(c)) => text.push(c.content.clone()),
-                Some(message_info::Data::MediaContent(mc)) => media.push(if mc.media_name.is_empty() { mc.mime_type.clone() } else { mc.media_name.clone() }),
+                Some(message_info::Data::MediaContent(mc)) => media.push(Media { id: mc.media_id.clone(), key: mc.decryption_key.clone(), name: mc.media_name.clone(), mime: mc.mime_type.clone() }),
                 None => {}
             }
         }
@@ -34,6 +34,18 @@ impl Msg {
             status: m.message_status.as_ref().map(|s| s.status).unwrap_or(0),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct Media {
+    pub id: String,
+    pub key: Vec<u8>,
+    pub name: String,
+    pub mime: String,
+}
+impl Media {
+    pub fn is_image(&self) -> bool { self.mime.starts_with("image/") }
+    pub fn label(&self) -> String { if self.name.is_empty() { self.mime.clone() } else { self.name.clone() } }
 }
 
 #[derive(Clone, Debug)]
