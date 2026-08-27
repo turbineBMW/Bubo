@@ -86,7 +86,11 @@ impl Client {
         h.insert("sec-fetch-site", "same-origin".parse().unwrap());
         let mut req = self.http.get(http::URL_CONFIG).headers(h);
         if let Some((c, a)) = cookies { req = req.header("cookie", c).header("authorization", a); }
-        let cfg: Config = http::parse(req.send().await?).await?;
+        let resp = req.send().await?;
+        if resp.url().host_str() == Some("accounts.google.com") || resp.url().path().contains("ServiceLogin") {
+            anyhow::bail!("the Google session cookies didn't authenticate (missing OSID?). Try signing in again.");
+        }
+        let cfg: Config = http::parse(resp).await?;
         if let Some(id) = cfg.device_info.as_ref().map(|d| d.device_id.clone()).filter(|s| !s.is_empty()) { self.auth.lock().unwrap().session_id = Some(id); }
         Ok(cfg)
     }

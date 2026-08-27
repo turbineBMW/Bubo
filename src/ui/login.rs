@@ -27,48 +27,32 @@ impl LoginPage {
 
         let done = Rc::new(Cell::new(false));
         let on_cookies = Rc::new(on_cookies);
-        // Once sign-in redirects into the web app, take the cookies and refuse the navigation:
-        // the real web client would otherwise start its own pairing handshake and supersede ours.
-        // Ask the cookie jar for messages.google.com; `f` gets the map if it has a SAPISID (= signed in).
-        let with_session = |wv: &webkit6::WebView, f: Box<dyn FnOnce(Option<std::collections::HashMap<String, String>>)>| {
-            let mgr = wv.network_session().unwrap().cookie_manager().unwrap();
-            mgr.cookies("https://messages.google.com/", None::<&gtk4::gio::Cancellable>, move |res| {
-                let map: std::collections::HashMap<String, String> = res.ok().map(|mut c| c.iter_mut().filter_map(|c| Some((c.name()?.to_string(), c.value()?.to_string()))).collect()).unwrap_or_default();
-                f(if map.contains_key("SAPISID") { Some(map) } else { None });
-            });
-        };
-        let finish = {
-            let (done, on_cookies) = (done.clone(), on_cookies.clone());
-            move |wv: &webkit6::WebView, map: std::collections::HashMap<String, String>| {
-                if done.replace(true) { return; }
-                let wv = wv.clone();
-                // Leave WebKit's callback first; then blank the view and hand the cookies over.
-                gtk4::glib::idle_add_local_once(move || { wv.stop_loading(); wv.load_uri("about:blank"); on_cookies(map); });
-            }
-        };
+        // messages.google.com authenticates with an OSID cookie that is only issued while the
+        // /web app page loads, so we must let that page load. We poll the cookie jar until both
+        // SAPISID and OSID are present, then harvest and tear the WebView down — starting our own
+        // pairing only afterwards, so the web app's rival handshake can't supersede ours.
         let is_app_url = |u: &str| u.starts_with("https://messages.google.com/web") && !u.starts_with("https://messages.google.com/web/authentication");
-        // Once signed in, the app URL is where the real web client would boot and start its own
-        // pairing handshake (which supersedes ours). Decide asynchronously: signed in → take the
-        // cookies and refuse the navigation; not yet → let it through (that's the sign-in hop).
-        let (f, d) = (finish.clone(), done.clone());
-        web.connect_decide_policy(move |wv, decision, kind| {
-            if kind != webkit6::PolicyDecisionType::NavigationAction || d.get() { return false; }
-            let Some(nav) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() else { return false };
-            let Some(uri) = nav.navigation_action().and_then(|a| a.request()).and_then(|r| r.uri()) else { return false };
-            if !is_app_url(&uri) { return false; }
-            let (decision, wv, f) = (decision.clone(), wv.clone(), f.clone());
-            with_session(&wv.clone(), Box::new(move |map| match map {
-                Some(map) => { decision.ignore(); f(&wv, map); }
-                None => { decision.use_(); }
-            }));
-            true
-        });
-        // Belt and braces: if the app page starts loading anyway, harvest at commit time, before its JS runs far.
+        fn try_harvest(wv: &webkit6::WebView, done: Rc<Cell<bool>>, on_cookies: Rc<dyn Fn(std::collections::HashMap<String, String>)>, attempt: u32) {
+            if done.get() { return; }
+            let mgr = wv.network_session().unwrap().cookie_manager().unwrap();
+            let (wv, done, on_cookies) = (wv.clone(), done.clone(), on_cookies.clone());
+            mgr.cookies("https://messages.google.com/", None::<&gtk4::gio::Cancellable>, move |res| {
+                if done.get() { return; }
+                let map: std::collections::HashMap<String, String> = res.ok().map(|mut c| c.iter_mut().filter_map(|c| Some((c.name()?.to_string(), c.value()?.to_string()))).collect()).unwrap_or_default();
+                let ready = map.contains_key("SAPISID") && map.contains_key("OSID");
+                if ready || (attempt >= 25 && map.contains_key("SAPISID")) {
+                    if done.replace(true) { return; }
+                    if !map.contains_key("OSID") { tracing::warn!("proceeding without OSID cookie; /web/config may 401"); }
+                    let (wv, on_cookies) = (wv.clone(), on_cookies.clone());
+                    gtk4::glib::idle_add_local_once(move || { wv.stop_loading(); wv.load_uri("about:blank"); on_cookies(map); });
+                } else {
+                    gtk4::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || try_harvest(&wv, done, on_cookies, attempt + 1));
+                }
+            });
+        }
         web.connect_load_changed(move |wv, ev| {
             if !matches!(ev, webkit6::LoadEvent::Committed | webkit6::LoadEvent::Finished) { return; }
-            if !wv.uri().map(|u| is_app_url(&u)).unwrap_or(false) { return; }
-            let (wv2, f) = (wv.clone(), finish.clone());
-            with_session(wv, Box::new(move |map| if let Some(map) = map { f(&wv2, map) }));
+            if wv.uri().map(|u| is_app_url(&u)).unwrap_or(false) { try_harvest(wv, done.clone(), on_cookies.clone(), 0); }
         });
         web.load_uri(START_URL);
         Self { widget }
@@ -91,7 +75,7 @@ impl EmojiPage {
         self.widget.set_description(Some("Messages on the phone is asking you to confirm a new device.\nPick the emoji that matches this one."));
         self.widget.set_child(Some(&l));
     }
-    pub fn error(&self, e: &str) { self.widget.set_title("Pairing failed"); self.widget.set_description(Some(e)); self.widget.set_child(None::<&gtk4::Widget>); }
+    pub fn error(&self, e: &str) { self.widget.set_title("Pairing failed"); self.widget.set_description(Some(&gtk4::glib::markup_escape_text(e))); self.widget.set_child(None::<&gtk4::Widget>); }
     pub fn paired(&self) { self.widget.set_title("Paired!"); self.widget.set_description(Some("Connecting…")); self.widget.set_child(None::<&gtk4::Widget>); }
 }
 
