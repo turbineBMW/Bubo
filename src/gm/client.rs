@@ -571,6 +571,19 @@ impl Client {
         })
     }
 
+    /// Delete a conversation on the phone. The phone follows up with a `Conversation` event
+    /// carrying `status = DELETED`, which is what drops it from the list.
+    pub async fn delete_conversation(&self, conversation_id: &str) -> Result<()> {
+        let req = UpdateConversationRequest {
+            action: ConversationActionStatus::Delete as i32,
+            conversation_id: conversation_id.into(),
+            action5: Some(ConversationAction5 { field2: true }),
+            data: Some(update_conversation_request::Data::DeleteData(DeleteConversationData { conversation_id: conversation_id.into(), phone: None })),
+        };
+        let r: UpdateConversationResponse = self.call(ActionType::UpdateConversation, req, true).await?;
+        if !r.success { bail!("phone refused to delete the conversation") }
+        Ok(())
+    }
     pub async fn is_bugle_default(&self) -> Result<bool> {
         Ok(self.call::<_, IsBugleDefaultResponse>(ActionType::IsBugleDefault, EmptyArr {}, false).await?.success)
     }

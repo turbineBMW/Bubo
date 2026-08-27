@@ -89,6 +89,9 @@ pub struct Conv {
     pub is_rcs: bool,
     /// Participant ids other than us — the keys used to fetch contact photos from the phone.
     pub participant_ids: Vec<String>,
+    /// The phone reports deleted conversations as updates with `status = DELETED` rather than
+    /// dropping them, so the list has to filter them out itself.
+    pub deleted: bool,
 }
 
 impl Conv {
@@ -102,6 +105,7 @@ impl Conv {
             ts: c.last_message_timestamp, unread: c.unread, unread_count: 0, is_group: c.is_group_chat,
             default_outgoing_id: c.default_outgoing_id.clone(), latest_message_id: c.latest_message_id.clone(),
             is_rcs: c.r#type == 2,
+            deleted: c.status == 3,
             participant_ids: {
                 // `otherParticipants` is only filled for groups; 1:1 chats list everyone in `participants`.
                 let mut ids: Vec<String> = c.participants.iter().filter(|p| !p.is_me)

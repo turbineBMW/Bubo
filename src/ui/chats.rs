@@ -205,6 +205,13 @@ impl ChatsView {
         if let Some(app) = self.win.application() { app.add_action(&prefs); }
         let me = self.clone();
         self.new_chat.connect_clicked(move |_| me.show_new_chat());
+        // right-click menu actions (the popover itself is attached per row in `conv_row`)
+        let group = gtk4::gio::SimpleActionGroup::new();
+        let delete = gtk4::gio::SimpleAction::new("delete", Some(glib::VariantTy::STRING));
+        let me = self.clone();
+        delete.connect_activate(move |_, p| { if let Some(id) = p.and_then(|v| v.get::<String>()) { me.confirm_delete(id); } });
+        group.add_action(&delete);
+        self.list.insert_action_group("conv", Some(&group));
         // selection → open thread
         let me = self.clone();
         self.list.connect_row_selected(move |_, row| {
@@ -269,12 +276,57 @@ impl ChatsView {
     }
 
     fn upsert_conv(&self, c: Conv) {
+        if c.deleted { self.remove_conv(&c.id); return; }
         let mut st = self.st.borrow_mut();
         match st.convs.iter_mut().find(|x| x.id == c.id) {
             Some(x) => { let n = if c.unread { x.unread_count } else { 0 }; *x = c; x.unread_count = n; }
             None => st.convs.push(c),
         }
         st.convs.sort_by(|a, b| b.ts.cmp(&a.ts));
+    }
+
+    /// Drop a conversation from local state; closes the thread if it was the one open.
+    fn remove_conv(&self, id: &str) {
+        let mut st = self.st.borrow_mut();
+        st.convs.retain(|c| c.id != id);
+        st.messages.remove(id);
+        st.cursors.remove(id);
+        if st.current.as_deref() == Some(id) {
+            st.current = None;
+            drop(st);
+            while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
+            self.thread_title.set_title("");
+            self.thread_title.set_subtitle("");
+            self.composer.set_visible(false);
+            self.content_stack.set_visible_child_name("empty");
+            self.widget.set_show_content(false);
+        }
+    }
+
+    /// Right-click on a conversation row: context menu (delete).
+    fn confirm_delete(self: &Rc<Self>, id: String) {
+        let name = self.st.borrow().convs.iter().find(|c| c.id == id).map(|c| c.name.clone()).unwrap_or_default();
+        let dlg = adw::AlertDialog::new(Some("Delete conversation?"), Some(&format!("“{name}” and all its messages will be deleted from your phone.")));
+        dlg.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+        dlg.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+        dlg.set_default_response(Some("cancel"));
+        dlg.set_close_response("cancel");
+        let me = self.clone();
+        dlg.choose(Some(&self.win), None::<&gtk4::gio::Cancellable>, move |resp| {
+            if resp != "delete" { return }
+            let c = me.client.clone();
+            let id2 = id.clone();
+            let (tx, rx) = async_channel::bounded(1);
+            crate::rt::spawn(async move { let _ = tx.send(c.delete_conversation(&id2).await).await; });
+            let me = me.clone();
+            glib::spawn_future_local(async move {
+                match rx.recv().await {
+                    Ok(Ok(())) => { me.remove_conv(&id); me.rebuild_list(); }
+                    Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Could not delete conversation: {e:#}"))),
+                    Err(_) => {}
+                }
+            });
+        });
     }
 
     fn rebuild_list(&self) {
@@ -859,6 +911,28 @@ fn conv_row(c: &Conv, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> 
     row_box.append(&overlay); row_box.append(&col);
     let row = gtk4::ListBoxRow::builder().child(&row_box).build();
     unsafe { row.set_data("conv-id", c.id.clone()); }
+
+    // Right-click (or long-press) → context menu. Actions live in the "conv" group on the list.
+    let menu = gtk4::gio::Menu::new();
+    let del = gtk4::gio::MenuItem::new(Some("Delete conversation"), None);
+    del.set_action_and_target_value(Some("conv.delete"), Some(&c.id.to_variant()));
+    menu.append_item(&del);
+    let popover = gtk4::PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(&row);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk4::Align::Start);
+    popover.connect_closed(|p| p.set_visible(false));
+    let pop = popover.clone();
+    let show = move |x: f64, y: f64| { pop.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1))); pop.popup(); };
+    let click = gtk4::GestureClick::builder().button(gtk4::gdk::BUTTON_SECONDARY).build();
+    let s = show.clone();
+    click.connect_pressed(move |g, _, x, y| { g.set_state(gtk4::EventSequenceState::Claimed); s(x, y); });
+    row.add_controller(click);
+    let press = gtk4::GestureLongPress::builder().touch_only(true).build();
+    press.connect_pressed(move |g, x, y| { g.set_state(gtk4::EventSequenceState::Claimed); show(x, y); });
+    row.add_controller(press);
+    // Unparent the popover when the row goes away, or GTK warns about a dangling child.
+    row.connect_destroy(move |_| popover.unparent());
     row
 }
 
