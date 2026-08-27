@@ -27,17 +27,36 @@ impl LoginPage {
 
         let done = Rc::new(Cell::new(false));
         let on_cookies = Rc::new(on_cookies);
-        web.connect_load_changed(move |wv, ev| {
-            if ev != webkit6::LoadEvent::Finished || done.get() { return; }
-            let Some(uri) = wv.uri() else { return };
-            if !uri.starts_with("https://messages.google.com/") { return; }
-            let mgr = wv.network_session().unwrap().cookie_manager().unwrap();
+        // Once sign-in redirects into the web app, take the cookies and refuse the navigation:
+        // the real web client would otherwise start its own pairing handshake and supersede ours.
+        let harvest = {
             let (done, on_cookies) = (done.clone(), on_cookies.clone());
-            mgr.cookies("https://messages.google.com/", None::<&gtk4::gio::Cancellable>, move |res| {
-                let Ok(mut cookies) = res else { return };
-                let map: std::collections::HashMap<String, String> = cookies.iter_mut().filter_map(|c| Some((c.name()?.to_string(), c.value()?.to_string()))).collect();
-                if map.contains_key("SAPISID") && !done.replace(true) { on_cookies(map); }
-            });
+            move |wv: &webkit6::WebView| {
+                if done.get() { return; }
+                let mgr = wv.network_session().unwrap().cookie_manager().unwrap();
+                let (done, on_cookies, wv) = (done.clone(), on_cookies.clone(), wv.clone());
+                mgr.cookies("https://messages.google.com/", None::<&gtk4::gio::Cancellable>, move |res| {
+                    let Ok(mut cookies) = res else { return };
+                    let map: std::collections::HashMap<String, String> = cookies.iter_mut().filter_map(|c| Some((c.name()?.to_string(), c.value()?.to_string()))).collect();
+                    if map.contains_key("SAPISID") && !done.replace(true) { wv.stop_loading(); wv.load_uri("about:blank"); on_cookies(map); }
+                });
+            }
+        };
+        let is_app_url = |u: &str| u.starts_with("https://messages.google.com/web") && !u.starts_with("https://messages.google.com/web/authentication");
+        let h = harvest.clone();
+        web.connect_decide_policy(move |wv, decision, kind| {
+            if kind != webkit6::PolicyDecisionType::NavigationAction { return false; }
+            let Some(nav) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>() else { return false };
+            let Some(uri) = nav.navigation_action().and_then(|a| a.request()).and_then(|r| r.uri()) else { return false };
+            if !is_app_url(&uri) { return false; }
+            decision.ignore();
+            h(wv);
+            true
+        });
+        // Fallback: if the app page did load somehow, still harvest (and blank it).
+        web.connect_load_changed(move |wv, ev| {
+            if ev != webkit6::LoadEvent::Finished { return; }
+            if wv.uri().map(|u| is_app_url(&u)).unwrap_or(false) { harvest(wv); }
         });
         web.load_uri(START_URL);
         Self { widget }

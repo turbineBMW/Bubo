@@ -32,6 +32,7 @@ fn start_pairing(win: &adw::ApplicationWindow, stack: &gtk4::Stack) {
             tracing::info!("got Google session cookies");
             client.auth.lock().unwrap().cookies = cookies;
             stack.set_visible_child_name("emoji");
+            if let Some(w) = stack.child_by_name("login") { stack.remove(&w); } // tear the WebView down for good
             login::run_gaia_pairing(client.clone(), ptx.clone());
         }
     });
