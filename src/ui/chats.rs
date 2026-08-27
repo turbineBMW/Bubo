@@ -406,16 +406,45 @@ impl ChatsView {
     }
 
     /// Bare image, scaled to fit within 360x480 (small thumbnails are scaled up), rounded corners.
-    fn image_picture(tex: &gtk4::gdk::Texture) -> gtk4::Picture {
-        let (w, h) = (tex.width().max(1) as f64, tex.height().max(1) as f64);
-        let k = (360.0 / w).min(480.0 / h);
-        let pic = gtk4::Picture::for_paintable(tex);
+    /// GIFs animate: frames are pulled from a PixbufAnimation on a timer for as long as the widget lives.
+    fn image_picture(bytes: &[u8]) -> anyhow::Result<gtk4::Picture> {
+        let pic = gtk4::Picture::new();
         pic.set_content_fit(gtk4::ContentFit::Fill);
         pic.set_can_shrink(true);
-        pic.set_size_request((w * k).round() as i32, (h * k).round() as i32);
         pic.set_overflow(gtk4::Overflow::Hidden);
         pic.add_css_class("bubo-image");
-        pic
+        let fit = |pic: &gtk4::Picture, w: i32, h: i32| {
+            let (w, h) = (w.max(1) as f64, h.max(1) as f64);
+            let k = (360.0 / w).min(480.0 / h);
+            pic.set_size_request((w * k).round() as i32, (h * k).round() as i32);
+        };
+        if bytes.starts_with(b"GIF8") {
+            use gtk4::gdk_pixbuf::{PixbufAnimation, PixbufLoader};
+            let loader = PixbufLoader::new();
+            loader.write(bytes)?;
+            loader.close()?;
+            let anim: PixbufAnimation = loader.animation().ok_or_else(|| anyhow::anyhow!("no animation"))?;
+            fit(&pic, anim.width(), anim.height());
+            let iter = anim.iter(None);
+            pic.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+            if !anim.is_static_image() {
+                fn tick(pic: glib::WeakRef<gtk4::Picture>, iter: gtk4::gdk_pixbuf::PixbufAnimationIter) {
+                    let delay = iter.delay_time().unwrap_or(std::time::Duration::from_millis(100)).max(std::time::Duration::from_millis(20));
+                    glib::timeout_add_local_once(delay, move || {
+                        let Some(p) = pic.upgrade() else { return };
+                        iter.advance(std::time::SystemTime::now());
+                        p.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+                        tick(pic, iter);
+                    });
+                }
+                tick(pic.downgrade(), iter);
+            }
+        } else {
+            let tex = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(bytes))?;
+            fit(&pic, tex.width(), tex.height());
+            pic.set_paintable(Some(&tex));
+        }
+        Ok(pic)
     }
 
     /// A clickable attachment: images load inline on click; other files save to ~/Downloads.
@@ -426,8 +455,7 @@ impl ChatsView {
         // Inline bytes (no download needed) — render or offer to save immediately.
         if !md.inline.is_empty() {
             if md.is_image() {
-                if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&md.inline)) {
-                    let pic = Self::image_picture(&tex);
+                if let Ok(pic) = Self::image_picture(&md.inline) {
                     holder.append(&pic);
                     // Inline bytes are usually a low-res preview: a click fetches the full image.
                     if let Some((att_id, key)) = md.source() {
@@ -441,8 +469,8 @@ impl ChatsView {
                             let (me, holder2, pic2, busy) = (me.clone(), holder2.clone(), pic2.clone(), busy.clone());
                             glib::spawn_future_local(async move {
                                 match rx.recv().await {
-                                    Ok(Ok(bytes)) => match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-                                        Ok(tex) => { holder2.remove(&pic2); holder2.append(&Self::image_picture(&tex)); }
+                                    Ok(Ok(bytes)) => match Self::image_picture(&bytes) {
+                                        Ok(pic) => { holder2.remove(&pic2); holder2.append(&pic); }
                                         Err(e) => { busy.set(false); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
                                     },
                                     Ok(Err(e)) => { busy.set(false); me.toast.add_toast(adw::Toast::new(&format!("Download failed: {e:#}"))); }
@@ -477,9 +505,9 @@ impl ChatsView {
                 match rx.recv().await {
                     Ok(Ok(bytes)) => {
                         if md.is_image() {
-                            match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
-                                Ok(tex) => {
-                                    holder2.remove(&btn2); holder2.append(&Self::image_picture(&tex));
+                            match Self::image_picture(&bytes) {
+                                Ok(pic) => {
+                                    holder2.remove(&btn2); holder2.append(&pic);
                                 }
                                 Err(e) => { btn2.set_sensitive(true); btn2.set_label(&format!("🖼 {}", md.label())); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
                             }
