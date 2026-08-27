@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Bubo
+Comment=Google Messages for the desktop
+Exec=bubo
+Icon=dev.turbinebmw.Bubo
+Terminal=false
+Type=Application
+Categories=Network;Chat;GTK;
+StartupNotify=true
