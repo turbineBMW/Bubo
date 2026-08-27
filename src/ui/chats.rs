@@ -100,6 +100,7 @@ impl ChatsView {
             .bubo-bubble { padding: 8px 12px; border-radius: 16px; }
             .bubo-me { background: @accent_bg_color; color: @accent_fg_color; }
             .bubo-them { background: alpha(currentColor, 0.08); }
+            .bubo-image { border-radius: 16px; }
             .bubo-thread row { background: transparent; border: none; box-shadow: none; padding: 0; margin: 2px 0; }
             .bubo-meta { font-size: 0.8em; opacity: 0.7; }
             .bubo-snippet { opacity: 0.7; }
@@ -382,20 +383,39 @@ fn conv_row(c: &Conv) -> gtk4::ListBoxRow {
 
 impl ChatsView {
     fn bubble(self: &Rc<Self>, m: &Msg, group: bool) -> gtk4::ListBoxRow {
-    let bubble = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).css_classes(["bubo-bubble", if m.from_me { "bubo-me" } else { "bubo-them" }]).build();
+    let halign = if m.from_me { gtk4::Align::End } else { gtk4::Align::Start };
+    let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(4).halign(halign).build();
+    let bubble = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).css_classes(["bubo-bubble", if m.from_me { "bubo-me" } else { "bubo-them" }]).halign(halign).build();
     if group && !m.from_me && !m.sender.is_empty() {
         bubble.append(&gtk4::Label::builder().label(&m.sender).xalign(0.0).css_classes(["caption", "heading"]).build());
     }
-    for md in &m.media { bubble.append(&self.attachment_widget(md)); }
+    // Images stand alone (no bubble, Android-Messages style); other files sit inside the bubble.
+    for md in &m.media {
+        let w = self.attachment_widget(md);
+        if md.is_image() { w.set_halign(halign); col.append(&w); } else { bubble.append(&w); }
+    }
     if !m.text.trim().is_empty() {
         bubble.append(&gtk4::Label::builder().label(&m.text).wrap(true).wrap_mode(gtk4::pango::WrapMode::WordChar).xalign(0.0).selectable(true).max_width_chars(60).build());
     }
+    if bubble.first_child().is_some() { col.append(&bubble); }
     let mut meta = fmt_time(m.ts);
     if m.from_me { meta.push_str(match m.status { 1 | 2 | 3 | 4 | 5 | 6 => " · sent", 11 => " · delivered", 12 => " · read", s if s >= 100 => " · failed", _ => "" }); }
-    let meta = gtk4::Label::builder().label(&meta).css_classes(["bubo-meta"]).halign(if m.from_me { gtk4::Align::End } else { gtk4::Align::Start }).build();
-    let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(1).halign(if m.from_me { gtk4::Align::End } else { gtk4::Align::Start }).build();
-    col.append(&bubble); col.append(&meta);
+    let meta = gtk4::Label::builder().label(&meta).css_classes(["bubo-meta"]).halign(halign).build();
+    col.append(&meta);
     gtk4::ListBoxRow::builder().child(&col).activatable(false).selectable(false).build()
+    }
+
+    /// Bare image, scaled to fit within 360x480 (small thumbnails are scaled up), rounded corners.
+    fn image_picture(tex: &gtk4::gdk::Texture) -> gtk4::Picture {
+        let (w, h) = (tex.width().max(1) as f64, tex.height().max(1) as f64);
+        let k = (360.0 / w).min(480.0 / h);
+        let pic = gtk4::Picture::for_paintable(tex);
+        pic.set_content_fit(gtk4::ContentFit::Fill);
+        pic.set_can_shrink(true);
+        pic.set_size_request((w * k).round() as i32, (h * k).round() as i32);
+        pic.set_overflow(gtk4::Overflow::Hidden);
+        pic.add_css_class("bubo-image");
+        pic
     }
 
     /// A clickable attachment: images load inline on click; other files save to ~/Downloads.
@@ -407,9 +427,32 @@ impl ChatsView {
         if !md.inline.is_empty() {
             if md.is_image() {
                 if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&md.inline)) {
-                    let pic = gtk4::Picture::for_paintable(&tex);
-                    pic.set_can_shrink(true); pic.set_content_fit(gtk4::ContentFit::ScaleDown); pic.set_size_request(-1, 240); pic.set_halign(gtk4::Align::Start);
+                    let pic = Self::image_picture(&tex);
                     holder.append(&pic);
+                    // Inline bytes are usually a low-res preview: a click fetches the full image.
+                    if let Some((att_id, key)) = md.source() {
+                        let click = gtk4::GestureClick::new();
+                        let (me, holder2, pic2, busy) = (self.clone(), holder.clone(), pic.clone(), Rc::new(std::cell::Cell::new(false)));
+                        click.connect_released(move |_, _, _, _| {
+                            if busy.replace(true) { return; }
+                            let (tx, rx) = async_channel::bounded(1);
+                            let (c, id, key) = (me.client.clone(), att_id.clone(), key.clone());
+                            crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
+                            let (me, holder2, pic2, busy) = (me.clone(), holder2.clone(), pic2.clone(), busy.clone());
+                            glib::spawn_future_local(async move {
+                                match rx.recv().await {
+                                    Ok(Ok(bytes)) => match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
+                                        Ok(tex) => { holder2.remove(&pic2); holder2.append(&Self::image_picture(&tex)); }
+                                        Err(e) => { busy.set(false); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
+                                    },
+                                    Ok(Err(e)) => { busy.set(false); me.toast.add_toast(adw::Toast::new(&format!("Download failed: {e:#}"))); }
+                                    Err(_) => busy.set(false),
+                                }
+                            });
+                        });
+                        pic.add_controller(click);
+                        pic.set_cursor_from_name(Some("pointer"));
+                    }
                     return holder.upcast();
                 }
             }
@@ -436,9 +479,7 @@ impl ChatsView {
                         if md.is_image() {
                             match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)) {
                                 Ok(tex) => {
-                                    let pic = gtk4::Picture::for_paintable(&tex);
-                                    pic.set_can_shrink(true); pic.set_content_fit(gtk4::ContentFit::ScaleDown); pic.set_size_request(-1, 240); pic.set_halign(gtk4::Align::Start);
-                                    holder2.remove(&btn2); holder2.append(&pic);
+                                    holder2.remove(&btn2); holder2.append(&Self::image_picture(&tex));
                                 }
                                 Err(e) => { btn2.set_sensitive(true); btn2.set_label(&format!("🖼 {}", md.label())); me.toast.add_toast(adw::Toast::new(&format!("Could not show image: {e}"))); }
                             }
