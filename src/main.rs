@@ -1,5 +1,7 @@
 mod accent;
 mod gm;
+mod notify;
+mod settings;
 mod rt;
 mod ui;
 

@@ -47,6 +47,8 @@ pub struct ChatsView {
     side_stack: gtk4::Stack,
     content_stack: gtk4::Stack,
     composer: gtk4::Box,
+    settings: Rc<RefCell<crate::settings::Settings>>,
+    notifier: Option<Rc<crate::notify::Notifier>>,
 }
 
 /// A centred spinner with a caption, used while a pane is waiting on the phone.
@@ -73,6 +75,7 @@ impl ChatsView {
         let side_scroll = gtk4::ScrolledWindow::builder().child(&list).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
         let side_header = adw::HeaderBar::builder().title_widget(&adw::WindowTitle::new("Bubo", "")).build();
         let menu = gtk4::gio::Menu::new();
+        menu.append(Some("Preferences"), Some("app.preferences"));
         menu.append(Some("Unpair phone"), Some("app.unpair"));
         side_header.pack_end(&gtk4::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build());
         let side_empty = adw::StatusPage::builder().icon_name("chat-message-new-symbolic").title("No conversations").description("Messages from your phone will show up here.").build();
@@ -123,7 +126,8 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer };
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer,
+            settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -141,14 +145,14 @@ impl ChatsView {
             self.thread_scroll.vadjustment().connect_value_changed(move |_| { if let Some(me) = me.upgrade() { me.maybe_load_older(); } });
         }
         // notification click → focus window and open that conversation
-        let open = gtk4::gio::SimpleAction::new("open-conversation", Some(glib::VariantTy::STRING));
+        if let Some(n) = &self.notifier {
+            let me = self.clone();
+            n.set_on_open(move |id, token| { me.focus_window(token); me.jump_to(id); });
+        }
+        let prefs = gtk4::gio::SimpleAction::new("preferences", None);
         let me = self.clone();
-        open.connect_activate(move |_, param| {
-            let Some(id) = param.and_then(|p| p.str()) else { return };
-            me.win.present();
-            if let Some(row) = me.st.borrow().rows.get(id) { me.list.select_row(Some(row)); } else { me.open(id); }
-        });
-        if let Some(app) = self.win.application() { app.add_action(&open); }
+        prefs.connect_activate(move |_, _| me.show_preferences());
+        if let Some(app) = self.win.application() { app.add_action(&prefs); }
         // selection → open thread
         let me = self.clone();
         self.list.connect_row_selected(move |_, row| {
@@ -483,13 +487,13 @@ impl ChatsView {
 
     /// Desktop notification for an inbound message, unless it's ours, backfill, or the
     /// conversation is already open in a focused window.
-    fn maybe_notify(&self, m: &Msg, is_old: bool) {
+    fn maybe_notify(self: &Rc<Self>, m: &Msg, is_old: bool) {
         if is_old || m.from_me { return; }
         let st = self.st.borrow();
         let focused_here = self.win.is_active() && st.current.as_deref() == Some(&m.conversation_id);
         if focused_here { return; }
         let conv = st.convs.iter().find(|c| c.id == m.conversation_id);
-        let title = conv.filter(|c| !c.name.is_empty()).map(|c| c.name.clone())
+        let mut title = conv.filter(|c| !c.name.is_empty()).map(|c| c.name.clone())
             .or_else(|| (!m.sender.is_empty()).then(|| m.sender.clone()))
             .unwrap_or_else(|| "New message".into());
         // In a group, prefix the sender so you know who spoke.
@@ -499,12 +503,82 @@ impl ChatsView {
             _ => m.text.clone(),
         };
         drop(st);
-        let Some(app) = self.win.application() else { return };
-        let notif = gtk4::gio::Notification::new(&title);
-        notif.set_body(Some(&body));
-        notif.set_default_action_and_target_value("app.open-conversation", Some(&m.conversation_id.to_variant()));
-        // One notification id per conversation, so a new message replaces the old bubble.
-        app.send_notification(Some(&format!("bubo-{}", m.conversation_id)), &notif);
+        let otp = crate::notify::detect_otp(&m.text);
+        if let Some(code) = &otp { title = format!("{code} · {title}"); }
+        let Some(n) = &self.notifier else { return };
+        n.send(crate::notify::Notice { conversation_id: m.conversation_id.clone(), title, body, otp }, &self.settings.borrow().notification_sound);
+    }
+
+    /// Bring the window to the front. On Wayland a compositor only grants focus to a window
+    /// holding a fresh xdg-activation token, which the notification daemon supplies with the
+    /// click; without one, fall back to asking the compositor directly where we know how.
+    fn focus_window(&self, token: Option<String>) {
+        match token {
+            Some(t) => { self.win.set_startup_id(&t); self.win.present(); }
+            None => {
+                self.win.present();
+                let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase();
+                if desktop.contains("hyprland") {
+                    let _ = std::process::Command::new("hyprctl").args(["dispatch", "focuswindow", "class:dev.turbinebmw.Bubo"]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+                }
+            }
+        }
+    }
+
+    fn jump_to(self: &Rc<Self>, id: &str) {
+        let row = self.st.borrow().rows.get(id).cloned();
+        match row { Some(row) => self.list.select_row(Some(&row)), None => self.open(id) }
+    }
+
+    fn show_preferences(self: &Rc<Self>) {
+        use crate::settings::Sound;
+        let dialog = adw::PreferencesDialog::new();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder().title("Notifications")
+            .description("The sound is requested from your notification daemon, which decides whether to play it — so do-not-disturb rules in your shell still apply.").build();
+        let choices = gtk4::StringList::new(&["System default", "Custom file", "None"]);
+        let sound_row = adw::ComboRow::builder().title("Sound").model(&choices).build();
+        let file_row = adw::ActionRow::builder().title("Sound file").activatable(true).build();
+        file_row.add_suffix(&gtk4::Image::from_icon_name("folder-open-symbolic"));
+        let current = self.settings.borrow().notification_sound.clone();
+        sound_row.set_selected(match &current { Sound::SystemDefault => 0, Sound::File(_) => 1, Sound::None => 2 });
+        if let Sound::File(p) = &current { file_row.set_subtitle(&p.to_string_lossy()); }
+        file_row.set_visible(matches!(current, Sound::File(_)));
+        let (me, fr) = (self.clone(), file_row.clone());
+        sound_row.connect_selected_notify(move |r| {
+            let mut s = me.settings.borrow_mut();
+            s.notification_sound = match r.selected() {
+                0 => Sound::SystemDefault,
+                1 => match &s.notification_sound { Sound::File(p) => Sound::File(p.clone()), _ => Sound::File(std::path::PathBuf::new()) },
+                _ => Sound::None,
+            };
+            fr.set_visible(r.selected() == 1);
+            s.save();
+        });
+        let (me, win) = (self.clone(), self.win.clone());
+        file_row.connect_activated(move |row| {
+            let filter = gtk4::FileFilter::new(); filter.set_name(Some("Audio")); filter.add_mime_type("audio/*");
+            let filters = gtk4::gio::ListStore::new::<gtk4::FileFilter>(); filters.append(&filter);
+            let chooser = gtk4::FileDialog::builder().title("Choose a notification sound").default_filter(&filter).filters(&filters).modal(true).build();
+            let (me, row) = (me.clone(), row.clone());
+            chooser.open(Some(&win), gtk4::gio::Cancellable::NONE, move |res| {
+                if let Ok(f) = res { if let Some(p) = f.path() {
+                    row.set_subtitle(&p.to_string_lossy());
+                    let mut s = me.settings.borrow_mut(); s.notification_sound = Sound::File(p); s.save();
+                } }
+            });
+        });
+        let test = adw::ButtonRow::builder().title("Send a test notification").build();
+        let me = self.clone();
+        test.connect_activated(move |_| {
+            if let Some(n) = &me.notifier {
+                n.send(crate::notify::Notice { conversation_id: String::new(), title: "123456 · Bubo".into(), body: "Your verification code is 123456".into(), otp: Some("123456".into()) }, &me.settings.borrow().notification_sound);
+            }
+        });
+        group.add(&sound_row); group.add(&file_row); group.add(&test);
+        page.add(&group);
+        dialog.add(&page);
+        dialog.present(Some(&self.win));
     }
 }
 
