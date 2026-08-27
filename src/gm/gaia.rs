@@ -159,7 +159,7 @@ impl Client {
         primaries.sort_by(|a, b| b.2.cmp(&a.2));
         if primaries.len() > 1 { tracing::warn!(?primaries, "multiple primary devices; using most recently seen"); }
         let (reg_id, unknown_int, _) = primaries.remove(0);
-        tracing::info!(%reg_id, "pairing target");
+        tracing::info!(%reg_id, n_primaries = primaries.len() + 1, "pairing target");
         self.auth.lock().unwrap().dest_reg_id = Some(reg_id);
         // Open the stream (unauthenticated mode) so the phone's replies have somewhere to land.
         let notified = self.stream_opened.notified();
@@ -213,7 +213,8 @@ impl Client {
             pairing_attempt_id: ps.id.clone(), browser_details: Some(browser_details()), start_timestamp: ps.start_ms, data,
             proposed_verification_code_version: if finish { 0 } else { 1 }, proposed_key_derivation_version: if finish { 0 } else { 1 },
         };
-        let opts = SendOpts { dont_encrypt: true, custom_ttl: Some(300_000_000), message_type: if finish { MessageType::BugleMessage } else { MessageType::Gaia2 }, ..Default::default() };
+        let opts = SendOpts { dont_encrypt: true, custom_ttl: Some(300_000_000), message_type: if finish { MessageType::BugleMessage } else { MessageType::Gaia2 },
+            timeout: Duration::from_secs(if finish { 330 } else { 25 }), ..Default::default() };
         let inc = self.send_rpc(action, Some(req), opts).await?.ok_or_else(|| anyhow!("no response"))?;
         let raw = inc.message.as_ref().map(|m| m.unencrypted_data.clone()).unwrap_or_default();
         Ok(GaiaPairingResponseContainer::decode(raw.as_slice())?)

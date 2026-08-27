@@ -8,7 +8,7 @@ use gm::proto::client::list_conversations_request::Folder;
 const APP_ID: &str = "dev.turbinebmw.Bubo";
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "bubo=info".parse().unwrap())).init();
+    init_logging();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("pair") => return rt::block_on(cli_pair()),
@@ -22,6 +22,20 @@ fn main() -> anyhow::Result<()> {
     app.connect_activate(ui::build);
     app.run_with_args::<&str>(&[]);
     Ok(())
+}
+
+/// stderr at RUST_LOG (default info) + always a debug log at ~/.cache/bubo/bubo.log.
+fn init_logging() {
+    use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr)
+        .with_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "bubo=info".parse().unwrap()));
+    let dir = directories::ProjectDirs::from("dev", "turbinebmw", "bubo").map(|d| d.cache_dir().to_path_buf()).unwrap();
+    let _ = std::fs::create_dir_all(&dir);
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("bubo.log")).ok();
+    let file_layer = file.map(|f| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(f))
+        .with_filter(tracing_subscriber::EnvFilter::new("bubo=debug")));
+    tracing_subscriber::registry().with(stderr).with(file_layer).init();
+    tracing::info!("bubo {} starting", env!("CARGO_PKG_VERSION"));
 }
 
 /// `bubo pair` — headless: prints a QR code to the terminal; scan it with Messages → Device pairing.

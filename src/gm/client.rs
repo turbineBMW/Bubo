@@ -45,9 +45,11 @@ pub struct SendOpts {
     pub dont_encrypt: bool,
     pub message_type: MessageType,
     pub expect_response: bool,
+    /// How long to wait for the phone's reply (default 60 s).
+    pub timeout: Duration,
 }
 impl Default for SendOpts {
-    fn default() -> Self { Self { request_id: None, omit_ttl: false, custom_ttl: None, dont_encrypt: false, message_type: MessageType::BugleMessage, expect_response: true } }
+    fn default() -> Self { Self { request_id: None, omit_ttl: false, custom_ttl: None, dont_encrypt: false, message_type: MessageType::BugleMessage, expect_response: true, timeout: Duration::from_secs(60) } }
 }
 
 #[allow(dead_code)]
@@ -292,6 +294,8 @@ impl Client {
             Err((id, e)) => { tracing::warn!("decode incoming {id}: {e:#}"); self.session.queue_ack(&id); return; }
         };
         self.session.queue_ack(&msg.response_id);
+        tracing::debug!(id = %msg.response_id, route = ?msg.route, action = ?msg.action(), session = msg.message.as_ref().map(|m| m.session_id.as_str()).unwrap_or(""),
+            enc = msg.message.as_ref().map(|m| m.encrypted_data.len()).unwrap_or(0), unenc = msg.message.as_ref().map(|m| m.unencrypted_data.len()).unwrap_or(0), "← frame");
         if self.session.deliver(&msg, self.is_google()) { return; }
         match msg.route {
             BugleRoute::PairEvent => {
@@ -435,10 +439,10 @@ impl Client {
         let sent: Result<OutgoingRpcResponse> = async { http::parse(self.post(false, &http::url_send_message(self.is_google()), http::body_pblite(&msg)?).await?).await }.await;
         if let Err(e) = sent { self.session.cancel(&request_id); return Err(e); }
         let Some(rx) = rx else { return Ok(None) };
-        match tokio::time::timeout(Duration::from_secs(60), rx).await {
-            Ok(Ok(inc)) => Ok(Some(inc)),
+        match tokio::time::timeout(opts.timeout, rx).await {
+            Ok(Ok(inc)) => { tracing::debug!(?action, %request_id, "← phone answered"); Ok(Some(inc)) }
             Ok(Err(_)) => { bail!("connection closed before {action:?} was answered") }
-            Err(_) => { self.session.cancel(&request_id); bail!("phone did not respond to {action:?} within 60s") }
+            Err(_) => { self.session.cancel(&request_id); bail!("phone did not respond to {action:?} within {:?}", opts.timeout) }
         }
     }
 
