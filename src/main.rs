@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
     let app = adw::Application::builder().application_id(APP_ID).flags(gtk4::gio::ApplicationFlags::NON_UNIQUE).build();
-    app.connect_activate(ui::build);
+    app.connect_activate(|app| { gtk4::Window::set_default_icon_name(APP_ID); ui::build(app); });
     app.run_with_args::<&str>(&[]);
     Ok(())
 }

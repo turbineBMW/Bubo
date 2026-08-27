@@ -20,6 +20,7 @@ struct State {
 
 pub struct ChatsView {
     pub widget: adw::NavigationSplitView,
+    win: adw::ApplicationWindow,
     client: Arc<Client>,
     events: async_channel::Receiver<Event>,
     st: Rc<RefCell<State>>,
@@ -78,7 +79,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, toast, banner };
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, thread_title, entry, send, toast, banner };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -91,6 +92,15 @@ impl ChatsView {
     }
 
     pub fn start(self: &Rc<Self>) {
+        // notification click → focus window and open that conversation
+        let open = gtk4::gio::SimpleAction::new("open-conversation", Some(glib::VariantTy::STRING));
+        let me = self.clone();
+        open.connect_activate(move |_, param| {
+            let Some(id) = param.and_then(|p| p.str()) else { return };
+            me.win.present();
+            if let Some(row) = me.st.borrow().rows.get(id) { me.list.select_row(Some(row)); } else { me.open(id); }
+        });
+        if let Some(app) = self.win.application() { app.add_action(&open); }
         // selection → open thread
         let me = self.clone();
         self.list.connect_row_selected(move |_, row| {
@@ -136,7 +146,7 @@ impl ChatsView {
     fn handle(self: &Rc<Self>, ev: Event) {
         match ev {
             Event::Conversation(c) => { self.upsert_conv(Conv::from_proto(&c)); self.rebuild_list(); }
-            Event::Message { msg, .. } => self.push_message(Msg::from_proto(&msg)),
+            Event::Message { msg, is_old } => { let m = Msg::from_proto(&msg); self.maybe_notify(&m, is_old); self.push_message(m); }
             Event::PhoneNotResponding => { self.banner.set_title("Your phone isn't responding — is it online?"); self.banner.set_revealed(true); }
             Event::PhoneRespondingAgain | Event::Connected => self.banner.set_revealed(false),
             Event::ListenError(e) => { self.banner.set_title(&format!("Connection trouble: {e}")); self.banner.set_revealed(true); }
@@ -249,6 +259,34 @@ impl ChatsView {
                 Err(_) => {}
             }
         });
+    }
+}
+
+impl ChatsView {
+    /// Desktop notification for an inbound message, unless it's ours, backfill, or the
+    /// conversation is already open in a focused window.
+    fn maybe_notify(&self, m: &Msg, is_old: bool) {
+        if is_old || m.from_me { return; }
+        let st = self.st.borrow();
+        let focused_here = self.win.is_active() && st.current.as_deref() == Some(&m.conversation_id);
+        if focused_here { return; }
+        let conv = st.convs.iter().find(|c| c.id == m.conversation_id);
+        let title = conv.filter(|c| !c.name.is_empty()).map(|c| c.name.clone())
+            .or_else(|| (!m.sender.is_empty()).then(|| m.sender.clone()))
+            .unwrap_or_else(|| "New message".into());
+        // In a group, prefix the sender so you know who spoke.
+        let body = match (conv.map(|c| c.is_group).unwrap_or(false), m.text.trim().is_empty()) {
+            (_, true) if !m.media.is_empty() => "📎 Attachment".to_string(),
+            (true, _) if !m.sender.is_empty() => format!("{}: {}", m.sender, m.text),
+            _ => m.text.clone(),
+        };
+        drop(st);
+        let Some(app) = self.win.application() else { return };
+        let notif = gtk4::gio::Notification::new(&title);
+        notif.set_body(Some(&body));
+        notif.set_default_action_and_target_value("app.open-conversation", Some(&m.conversation_id.to_variant()));
+        // One notification id per conversation, so a new message replaces the old bubble.
+        app.send_notification(Some(&format!("bubo-{}", m.conversation_id)), &notif);
     }
 }
 
