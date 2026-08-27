@@ -5,7 +5,7 @@ use crate::gm::events::Event;
 use crate::gm::proto::client::list_conversations_request::Folder;
 use adw::prelude::*;
 use gtk4::glib;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -24,6 +24,17 @@ struct State {
 
 const PAGE: i64 = 50;
 
+/// Where the thread scroller should settle after its contents change.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ScrollTarget {
+    /// The user has scrolled on their own; leave the position alone.
+    Free,
+    /// Stick to the newest message.
+    Bottom,
+    /// Keep this distance (in pixels) from the end, so prepended pages don't shift the view.
+    FromBottom(f64),
+}
+
 pub struct ChatsView {
     pub widget: adw::NavigationSplitView,
     win: adw::ApplicationWindow,
@@ -33,6 +44,8 @@ pub struct ChatsView {
     list: gtk4::ListBox,
     thread: gtk4::ListBox,
     thread_scroll: gtk4::ScrolledWindow,
+    /// Where the thread should sit once GTK has laid out the rows just added to it.
+    scroll_target: Cell<ScrollTarget>,
     /// Full-resolution media bytes keyed by attachment id, so re-rendering a thread never refetches.
     media_cache: Rc<RefCell<HashMap<String, Rc<Vec<u8>>>>>,
     /// Contact photos keyed by participant id. `None` records a participant the phone has no
@@ -126,7 +139,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer,
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer,
             settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
@@ -142,7 +155,11 @@ impl ChatsView {
     pub fn start(self: &Rc<Self>) {
         {
             let me = Rc::downgrade(self);
-            self.thread_scroll.vadjustment().connect_value_changed(move |_| { if let Some(me) = me.upgrade() { me.maybe_load_older(); } });
+            self.thread_scroll.vadjustment().connect_value_changed(move |_| { if let Some(me) = me.upgrade() { me.on_thread_scrolled(); } });
+            let me = Rc::downgrade(self);
+            // Row heights only become known after layout, so the range (`upper`) changes some time
+            // after rows are appended. Apply the pending scroll target on every such change.
+            self.thread_scroll.vadjustment().connect_changed(move |_| { if let Some(me) = me.upgrade() { me.apply_scroll_target(); } });
         }
         // notification click → focus window and open that conversation
         if let Some(n) = &self.notifier {
@@ -313,7 +330,7 @@ impl ChatsView {
         self.composer.set_visible(true);
         self.entry.grab_focus();
         let loaded = self.st.borrow().messages.contains_key(id);
-        if loaded { self.render_thread(); } else {
+        if loaded { self.render_thread(ScrollTarget::Bottom); } else {
             while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
             self.content_stack.set_visible_child_name("loading");
             let c = self.client.clone(); let id2 = id.to_string();
@@ -327,7 +344,7 @@ impl ChatsView {
                         msgs.sort_by_key(|m| m.ts);
                         let more = (r.messages.len() as i64) >= PAGE;
                         { let mut st = me.st.borrow_mut(); st.messages.insert(id2.clone(), msgs); st.cursors.insert(id2.clone(), r.cursor.filter(|_| more)); }
-                        if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(); }
+                        if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(ScrollTarget::Bottom); }
                     }
                     Ok(Err(e)) => {
                         if me.st.borrow().current.as_deref() == Some(&id2) { me.content_stack.set_visible_child_name("thread"); }
@@ -348,6 +365,10 @@ impl ChatsView {
     fn push_message(self: &Rc<Self>, m: Msg, is_old: bool) {
         let conv_id = m.conversation_id.clone();
         let viewing = self.st.borrow().current.as_deref() == Some(&conv_id);
+        // Decide before touching the list: follow the conversation if the user is at its end or
+        // just sent something; otherwise hold their place while they read older messages.
+        let adj = self.thread_scroll.vadjustment();
+        let target = if m.from_me || self.at_bottom() || self.scroll_target.get() == ScrollTarget::Bottom { ScrollTarget::Bottom } else { ScrollTarget::FromBottom(adj.upper() - adj.value()) };
         let is_new = {
             let mut st = self.st.borrow_mut();
             let list = st.messages.entry(conv_id.clone()).or_default();
@@ -358,10 +379,11 @@ impl ChatsView {
             if let Some(c) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == conv_id) { c.unread = true; c.unread_count += 1; }
             self.rebuild_list();
         }
-        if viewing { self.render_thread(); }
+        if viewing { self.render_thread(target); }
     }
 
-    fn render_thread(self: &Rc<Self>) {
+    fn render_thread(self: &Rc<Self>, target: ScrollTarget) {
+        self.scroll_target.set(target);
         while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
         let st = self.st.borrow();
         let Some(cur) = &st.current else { return };
@@ -374,8 +396,38 @@ impl ChatsView {
         }
         for m in msgs { self.thread.append(&self.bubble(m, group)); }
         drop(st);
-        let sw = self.thread_scroll.clone();
-        glib::idle_add_local_once(move || { let adj = sw.vadjustment(); adj.set_value(adj.upper() - adj.page_size()); });
+        self.apply_scroll_target();
+    }
+
+    /// Move the thread to the pending target. Runs after every range change, so the position
+    /// holds while rows are laid out and images swap in; a user scroll releases it.
+    fn apply_scroll_target(&self) {
+        let adj = self.thread_scroll.vadjustment();
+        let value = match self.scroll_target.get() {
+            ScrollTarget::Free => return,
+            ScrollTarget::Bottom => adj.upper() - adj.page_size(),
+            ScrollTarget::FromBottom(d) => adj.upper() - d,
+        };
+        adj.set_value(value.max(0.0));
+    }
+
+    /// True when the thread is scrolled to (or within a few lines of) its end.
+    fn at_bottom(&self) -> bool {
+        let adj = self.thread_scroll.vadjustment();
+        adj.upper() - adj.value() - adj.page_size() < 48.0
+    }
+
+    /// A value change that leaves the thread where the target says it should be is one of our
+    /// own (or GTK clamping after rows were removed); anything else is the user scrolling away.
+    fn on_thread_scrolled(self: &Rc<Self>) {
+        let adj = self.thread_scroll.vadjustment();
+        let holds = match self.scroll_target.get() {
+            ScrollTarget::Free => false,
+            ScrollTarget::Bottom => self.at_bottom(),
+            ScrollTarget::FromBottom(d) => (adj.upper() - adj.value() - d).abs() < 1.0,
+        };
+        if !holds { self.scroll_target.set(ScrollTarget::Free); }
+        self.maybe_load_older();
     }
 
     /// Called on every scroll: when the top of the thread comes within a screen of view, fetch
@@ -410,13 +462,11 @@ impl ChatsView {
                         list.len() - before
                     };
                     if me.st.borrow().current.as_deref() != Some(&id) { return; }
-                    if added == 0 && !more { me.render_thread(); return; }
+                    if added == 0 && !more { me.render_thread(ScrollTarget::FromBottom(me.thread_scroll.vadjustment().upper() - me.thread_scroll.vadjustment().value())); return; }
                     // Preserve the visual position: keep the distance from the bottom constant.
                     let adj = me.thread_scroll.vadjustment();
                     let from_bottom = adj.upper() - adj.value();
-                    me.render_thread();
-                    let sw = me.thread_scroll.clone();
-                    glib::idle_add_local_once(move || { let adj = sw.vadjustment(); adj.set_value(adj.upper() - from_bottom); });
+                    me.render_thread(ScrollTarget::FromBottom(from_bottom));
                     // If the page was short enough that the top is still visible, keep going.
                     let me2 = me.clone();
                     glib::timeout_add_local_once(std::time::Duration::from_millis(100), move || me2.maybe_load_older());
