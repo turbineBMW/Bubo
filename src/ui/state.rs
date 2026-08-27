@@ -8,6 +8,10 @@ pub struct Msg {
     pub conversation_id: String,
     pub from_me: bool,
     pub sender: String,
+    /// Sender's full display name, participant id and avatar colour (for group-chat attribution).
+    pub sender_full: String,
+    pub sender_id: String,
+    pub sender_color: String,
     pub text: String,
     pub media: Vec<Media>,
     /// Microseconds since epoch.
@@ -34,6 +38,9 @@ impl Msg {
             id: m.message_id.clone(), tmp_id: m.tmp_id.clone(), conversation_id: m.conversation_id.clone(),
             from_me: sp.map(|p| p.is_me).unwrap_or(false),
             sender: sp.map(|p| if !p.first_name.is_empty() { p.first_name.clone() } else if !p.full_name.is_empty() { p.full_name.clone() } else { p.formatted_number.clone() }).unwrap_or_default(),
+            sender_full: sp.map(|p| if !p.full_name.is_empty() { p.full_name.clone() } else if !p.first_name.is_empty() { p.first_name.clone() } else { p.formatted_number.clone() }).unwrap_or_default(),
+            sender_id: sp.and_then(|p| p.id.as_ref()).map(|i| i.participant_id.clone()).unwrap_or_default(),
+            sender_color: sp.map(|p| p.avatar_hex_color.clone()).unwrap_or_default(),
             text: text.join("\n"), media, ts: m.timestamp,
             status: m.message_status.as_ref().map(|s| s.status).unwrap_or(0),
         }
@@ -80,6 +87,8 @@ pub struct Conv {
     pub default_outgoing_id: String,
     pub latest_message_id: String,
     pub is_rcs: bool,
+    /// Participant ids other than us — the keys used to fetch contact photos from the phone.
+    pub participant_ids: Vec<String>,
 }
 
 impl Conv {
@@ -93,6 +102,13 @@ impl Conv {
             ts: c.last_message_timestamp, unread: c.unread, unread_count: 0, is_group: c.is_group_chat,
             default_outgoing_id: c.default_outgoing_id.clone(), latest_message_id: c.latest_message_id.clone(),
             is_rcs: c.r#type == 2,
+            participant_ids: {
+                // `otherParticipants` is only filled for groups; 1:1 chats list everyone in `participants`.
+                let mut ids: Vec<String> = c.participants.iter().filter(|p| !p.is_me)
+                    .filter_map(|p| p.id.as_ref().map(|i| i.participant_id.clone())).filter(|s| !s.is_empty()).collect();
+                for o in &c.other_participants { if !ids.contains(o) { ids.push(o.clone()); } }
+                ids
+            },
         }
     }
 }

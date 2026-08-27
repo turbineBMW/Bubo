@@ -35,6 +35,9 @@ pub struct ChatsView {
     thread_scroll: gtk4::ScrolledWindow,
     /// Full-resolution media bytes keyed by attachment id, so re-rendering a thread never refetches.
     media_cache: Rc<RefCell<HashMap<String, Rc<Vec<u8>>>>>,
+    /// Contact photos keyed by participant id. `None` records a participant the phone has no
+    /// photo for, so we don't ask again every reload.
+    avatars: Rc<RefCell<HashMap<String, Option<gtk4::gdk::Texture>>>>,
     thread_title: adw::WindowTitle,
     entry: gtk4::Entry,
     send: gtk4::Button,
@@ -120,7 +123,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, media_cache: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer };
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -183,7 +186,7 @@ impl ChatsView {
         let me = self.clone();
         glib::spawn_future_local(async move {
             match rx.recv().await {
-                Ok(Ok(r)) => { for c in &r.conversations { me.upsert_conv(Conv::from_proto(c)); } me.rebuild_list(); }
+                Ok(Ok(r)) => { for c in &r.conversations { me.upsert_conv(Conv::from_proto(c)); } me.rebuild_list(); me.fetch_avatars(); }
                 Ok(Err(e)) => { me.rebuild_list(); me.toast.add_toast(adw::Toast::new(&format!("Could not load chats: {e:#}"))); }
                 Err(_) => {}
             }
@@ -192,7 +195,7 @@ impl ChatsView {
 
     fn handle(self: &Rc<Self>, ev: Event) {
         match ev {
-            Event::Conversation(c) => { self.upsert_conv(Conv::from_proto(&c)); self.rebuild_list(); }
+            Event::Conversation(c) => { self.upsert_conv(Conv::from_proto(&c)); self.rebuild_list(); self.fetch_avatars(); }
             Event::Message { msg, is_old } => { let m = Msg::from_proto(&msg); self.maybe_notify(&m, is_old); self.push_message(m, is_old); }
             Event::PhoneNotResponding => { self.banner.set_title("Your phone isn't responding — is it online?"); self.banner.set_revealed(true); }
             Event::PhoneRespondingAgain | Event::Connected => self.banner.set_revealed(false),
@@ -224,13 +227,76 @@ impl ChatsView {
         let convs = self.st.borrow().convs.clone();
         let mut rows = HashMap::new();
         for c in &convs {
-            let row = conv_row(c);
+            let row = conv_row(c, &self.avatars.borrow());
             self.list.append(&row);
             if Some(&c.id) == selected.as_ref() { self.list.select_row(Some(&row)); }
             rows.insert(c.id.clone(), row);
         }
         self.st.borrow_mut().rows = rows;
         self.side_stack.set_visible_child_name(if convs.is_empty() { "empty" } else { "list" });
+    }
+
+    /// Ask the phone for contact photos of every participant we haven't resolved yet, in one
+    /// batched RPC, and refresh the list when they land. Photos are cached on disk so a restart
+    /// doesn't round-trip through the phone again.
+    fn fetch_avatars(self: &Rc<Self>) {
+        let mut wanted: Vec<String> = Vec::new();
+        {
+            let st = self.st.borrow();
+            let mut cache = self.avatars.borrow_mut();
+            for c in &st.convs {
+                for p in &c.participant_ids {
+                    if cache.contains_key(p) || wanted.contains(p) { continue; }
+                    match load_cached_avatar(p) {
+                        Some(tex) => { cache.insert(p.clone(), Some(tex)); }
+                        None => wanted.push(p.clone()),
+                    }
+                }
+            }
+        }
+        // Rows were built before the disk hits above were loaded, so always apply them now.
+        self.refresh_avatars_in_place();
+        if wanted.is_empty() { return; }
+        let mut pending = self.avatars.borrow_mut();
+        for p in &wanted { pending.insert(p.clone(), None); } // mark in-flight; overwritten on reply
+        drop(pending);
+        let c = self.client.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        crate::rt::spawn(async move {
+            let mut out = Vec::new();
+            for chunk in wanted.chunks(40) {
+                match c.participant_thumbnails(chunk).await {
+                    Ok(r) => out.extend(r.thumbnail.into_iter().map(|t| (t.identifier, t.data.map(|d| d.image_buffer).unwrap_or_default()))),
+                    Err(e) => tracing::warn!("participant thumbnails: {e:#}"),
+                }
+            }
+            let _ = tx.send(out).await;
+        });
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            let Ok(thumbs) = rx.recv().await else { return };
+            let mut any = false;
+            for (id, bytes) in thumbs {
+                if bytes.is_empty() { continue; }
+                tracing::debug!("avatar {id}: {} bytes, head {:02x?}", bytes.len(), &bytes[..bytes.len().min(4)]);
+                match gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&bytes)) {
+                    Ok(tex) => { store_cached_avatar(&id, &bytes); me.avatars.borrow_mut().insert(id, Some(tex)); any = true; }
+                    Err(e) => tracing::warn!("avatar {id}: undecodable image: {e}"),
+                }
+            }
+            if any { me.refresh_avatars_in_place(); }
+        });
+    }
+
+    /// Swap in resolved photos on existing rows without rebuilding the list (keeps selection/scroll).
+    fn refresh_avatars_in_place(&self) {
+        let st = self.st.borrow();
+        let avatars = self.avatars.borrow();
+        for c in &st.convs {
+            let Some(row) = st.rows.get(&c.id) else { continue };
+            let Some(tex) = c.participant_ids.iter().find_map(|p| avatars.get(p).cloned().flatten()) else { continue };
+            if let Some(av) = find_avatar(row.upcast_ref()) { av.set_custom_image(Some(&tex)); }
+        }
     }
 
     fn open(self: &Rc<Self>, id: &str) {
@@ -445,10 +511,14 @@ impl ChatsView {
 /// One conversation in the sidebar, laid out Teams-style: the name and a single-line preview
 /// together stand exactly as tall as the avatar, with the time top-right and an unread badge
 /// pinned to the avatar's corner (blank for one unread message, a count for more).
-fn conv_row(c: &Conv) -> gtk4::ListBoxRow {
+fn conv_row(c: &Conv, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> gtk4::ListBoxRow {
     const SIZE: i32 = 40;
     let avatar = adw::Avatar::new(SIZE, Some(&c.name), true);
     if c.is_group { avatar.set_icon_name(Some("system-users-symbolic")); }
+    // First participant with a contact photo wins (for groups too — matches the phone's habit).
+    if let Some(tex) = c.participant_ids.iter().find_map(|p| avatars.get(p).cloned().flatten()) {
+        avatar.set_custom_image(Some(&tex));
+    }
     let overlay = gtk4::Overlay::builder().child(&avatar).valign(gtk4::Align::Center).build();
     if c.unread {
         let badge = gtk4::Label::builder().css_classes(["bubo-badge"]).halign(gtk4::Align::End).valign(gtk4::Align::End).build();
@@ -484,8 +554,18 @@ impl ChatsView {
     let halign = if m.from_me { gtk4::Align::End } else { gtk4::Align::Start };
     let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(4).halign(halign).build();
     let bubble = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).css_classes(["bubo-bubble", if m.from_me { "bubo-me" } else { "bubo-them" }]).halign(halign).build();
-    if group && !m.from_me && !m.sender.is_empty() {
-        bubble.append(&gtk4::Label::builder().label(&m.sender).xalign(0.0).css_classes(["caption", "heading"]).build());
+    // Group chats: attribute each message Google-Messages style — a small contact photo and the
+    // sender's full name in their avatar colour, sitting above the bubble rather than inside it.
+    if group && !m.from_me && !m.sender_full.is_empty() {
+        let av = adw::Avatar::new(24, Some(&m.sender_full), true);
+        if let Some(tex) = self.avatars.borrow().get(&m.sender_id).cloned().flatten() { av.set_custom_image(Some(&tex)); }
+        let name = gtk4::Label::builder().label(&m.sender_full).xalign(0.0).css_classes(["caption", "heading"]).build();
+        if m.sender_color.len() == 7 && m.sender_color.starts_with('#') {
+            name.set_markup(&format!("<span foreground=\"{}\">{}</span>", m.sender_color, glib::markup_escape_text(&m.sender_full)));
+        }
+        let hdr = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).halign(gtk4::Align::Start).build();
+        hdr.append(&av); hdr.append(&name);
+        col.append(&hdr);
     }
     // Images stand alone (no bubble, Android-Messages style); other files sit inside the bubble.
     for md in &m.media {
@@ -651,6 +731,37 @@ impl ChatsView {
         });
         holder.upcast()
     }
+}
+
+fn avatar_cache_path(participant_id: &str) -> Option<std::path::PathBuf> {
+    // Participant ids are opaque strings; hash them so they're safe filenames.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    participant_id.hash(&mut h);
+    let dir = directories::ProjectDirs::from("dev", "turbinebmw", "bubo")?.cache_dir().join("avatars");
+    Some(dir.join(format!("{:016x}", h.finish())))
+}
+
+fn load_cached_avatar(participant_id: &str) -> Option<gtk4::gdk::Texture> {
+    let bytes = std::fs::read(avatar_cache_path(participant_id)?).ok()?;
+    gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&bytes)).ok()
+}
+
+fn store_cached_avatar(participant_id: &str, bytes: &[u8]) {
+    let Some(p) = avatar_cache_path(participant_id) else { return };
+    if let Some(d) = p.parent() { let _ = std::fs::create_dir_all(d); }
+    let _ = std::fs::write(p, bytes);
+}
+
+/// Depth-first search for the `adw::Avatar` inside a conversation row.
+fn find_avatar(w: &gtk4::Widget) -> Option<adw::Avatar> {
+    if let Some(a) = w.downcast_ref::<adw::Avatar>() { return Some(a.clone()); }
+    let mut child = w.first_child();
+    while let Some(c) = child {
+        if let Some(a) = find_avatar(&c) { return Some(a); }
+        child = c.next_sibling();
+    }
+    None
 }
 
 fn save_download(md: &Media, bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {
