@@ -53,7 +53,8 @@ pub struct ChatsView {
     /// photo for, so we don't ask again every reload.
     avatars: Rc<RefCell<HashMap<String, Option<gtk4::gdk::Texture>>>>,
     thread_title: adw::WindowTitle,
-    entry: gtk4::Entry,
+    entry: gtk4::TextView,
+    emoji_btn: gtk4::Button,
     send: gtk4::Button,
     attach: gtk4::Button,
     gif_btn: gtk4::Button,
@@ -137,13 +138,24 @@ impl ChatsView {
         thread.add_css_class("bubo-thread");
         let thread_scroll = gtk4::ScrolledWindow::builder().child(&thread).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
         let thread_title = adw::WindowTitle::new("", "");
-        let entry = gtk4::Entry::builder().placeholder_text("Message").hexpand(true)
-            .secondary_icon_name("emoji-people-symbolic").secondary_icon_activatable(true).secondary_icon_tooltip_text("Insert emoji").build();
-        let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).build();
-        let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").build();
-        let gif_btn = gtk4::Button::builder().label("GIF").css_classes(["circular", "bubo-gif-btn"]).tooltip_text("Send a GIF").build();
-        let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).build();
-        composer.append(&attach); composer.append(&gif_btn); composer.append(&entry); composer.append(&send);
+        // Multi-line composer: Enter inserts a newline, Ctrl+Enter sends. The text view grows with
+        // its content up to a cap, then scrolls; the buttons sit at the bottom edge either way.
+        let entry = gtk4::TextView::builder().wrap_mode(gtk4::WrapMode::WordChar).hexpand(true).accepts_tab(false)
+            .top_margin(7).bottom_margin(7).left_margin(10).right_margin(10).css_classes(["bubo-entry"]).build();
+        let placeholder = gtk4::Label::builder().label("Message").halign(gtk4::Align::Start).valign(gtk4::Align::Start)
+            .margin_start(10).margin_top(7).can_target(false).css_classes(["dim-label"]).build();
+        let overlay = gtk4::Overlay::builder().child(&entry).build();
+        overlay.add_overlay(&placeholder);
+        let entry_scroll = gtk4::ScrolledWindow::builder().child(&overlay).hscrollbar_policy(gtk4::PolicyType::Never)
+            .propagate_natural_height(true).max_content_height(160).hexpand(true).css_classes(["bubo-entry-frame"]).build();
+        let pl = placeholder.clone();
+        entry.buffer().connect_changed(move |b| pl.set_visible(b.char_count() == 0));
+        let emoji_btn = gtk4::Button::builder().icon_name("emoji-people-symbolic").css_classes(["circular"]).tooltip_text("Insert emoji").valign(gtk4::Align::End).build();
+        let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).valign(gtk4::Align::End).tooltip_text("Send (Ctrl+Enter)").build();
+        let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").valign(gtk4::Align::End).build();
+        let gif_btn = gtk4::Button::builder().label("GIF").css_classes(["circular", "bubo-gif-btn"]).tooltip_text("Send a GIF").valign(gtk4::Align::End).build();
+        let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).valign(gtk4::Align::End).build();
+        composer.append(&attach); composer.append(&gif_btn); composer.append(&emoji_btn); composer.append(&entry_scroll); composer.append(&send);
         composer.set_visible(false);
         let banner = adw::Banner::builder().revealed(false).build();
         let content_empty = adw::StatusPage::builder().icon_name("user-available-symbolic").title("Select a conversation").description("Pick a chat from the list to start messaging.").build();
@@ -164,6 +176,11 @@ impl ChatsView {
             .bubo-me { background: var(--accent-bg-color); color: var(--accent-fg-color); }
             .bubo-them { background: alpha(currentColor, 0.08); }
             .bubo-image { border-radius: 16px; }
+            .bubo-entry-frame { border-radius: 18px; border: 1px solid alpha(currentColor, 0.15); background: alpha(currentColor, 0.05); }
+            .bubo-entry-frame:focus-within { border-color: var(--accent-bg-color); }
+            .bubo-entry, .bubo-entry text { background: transparent; }
+            /* the scrolled window otherwise reserves the scrollbar slider's 40px minimum, so an empty composer would start two lines tall */
+            .bubo-entry-frame scrollbar, .bubo-entry-frame scrollbar slider { min-height: 0; }
             .bubo-gif-btn { font-size: 0.7em; font-weight: bold; padding: 0 6px; }
             .bubo-gif-tile { padding: 0; border-radius: 8px; }
             .bubo-gif-tile picture { border-radius: 8px; }
@@ -178,7 +195,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
             settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
@@ -227,43 +244,36 @@ impl ChatsView {
         });
         // composer
         let me = self.clone();
-        self.entry.connect_activate(move |_| me.send_current());
+        let keys = gtk4::EventControllerKey::new();
+        keys.connect_key_pressed(move |_, key, _, state| {
+            let enter = matches!(key, gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::ISO_Enter);
+            if enter && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) { me.send_current(); glib::Propagation::Stop } else { glib::Propagation::Proceed }
+        });
+        self.entry.add_controller(keys);
         let me = self.clone();
         self.send.connect_clicked(move |_| me.send_current());
         let me = self.clone();
         self.attach.connect_clicked(move |_| me.pick_and_send());
         self.build_gif_picker();
-        // emoji picker: GTK's own chooser, anchored to the entry's trailing icon, inserting at the cursor
+        // emoji picker: GTK's own chooser, anchored to the emoji button, inserting at the cursor
         let chooser = gtk4::EmojiChooser::new();
-        chooser.set_parent(&self.entry);
+        chooser.set_parent(&self.emoji_btn);
         let entry = self.entry.clone();
         chooser.connect_emoji_picked(move |_, e| {
-            entry.delete_selection();
-            let mut pos = entry.position();
-            entry.insert_text(e, &mut pos);
-            entry.set_position(pos);
+            let b = entry.buffer();
+            b.delete_selection(true, true);
+            b.insert_at_cursor(e);
         });
         let entry = self.entry.clone();
-        // On close GTK hands focus back to the entry with its own grab_focus(), which select-alls;
-        // collapse that selection to the caret once it has happened.
-        chooser.connect_hide(move |_| {
-            let entry = entry.clone();
-            glib::idle_add_local_once(move || {
-                entry.grab_focus_without_selecting();
-                let p = entry.position();
-                entry.select_region(p, p);
-            });
-        });
-        self.entry.connect_icon_press(move |e, pos| {
-            if pos != gtk4::EntryIconPosition::Secondary { return; }
-            chooser.set_pointing_to(Some(&e.icon_area(pos)));
+        chooser.connect_hide(move |_| { let entry = entry.clone(); glib::idle_add_local_once(move || { entry.grab_focus(); }); });
+        self.emoji_btn.connect_clicked(move |_| {
             chooser.popup();
         });
         // typing indicator: notify the phone (throttled) while the user types
         let me = self.clone();
         let last = Rc::new(RefCell::new(std::time::Instant::now() - std::time::Duration::from_secs(10)));
-        self.entry.connect_changed(move |e| {
-            if e.text().is_empty() || last.borrow().elapsed() < std::time::Duration::from_secs(4) { return; }
+        self.entry.buffer().connect_changed(move |b| {
+            if b.char_count() == 0 || last.borrow().elapsed() < std::time::Duration::from_secs(4) { return; }
             *last.borrow_mut() = std::time::Instant::now();
             if let Some(id) = me.st.borrow().current.clone() { let c = me.client.clone(); crate::rt::spawn(async move { let _ = c.set_typing(&id, true).await; }); }
         });
@@ -607,12 +617,17 @@ impl ChatsView {
         });
     }
 
+    fn entry_text(&self) -> String {
+        let b = self.entry.buffer();
+        b.text(&b.start_iter(), &b.end_iter(), false).to_string()
+    }
+
     fn send_current(self: &Rc<Self>) {
-        let text = self.entry.text().to_string();
+        let text = self.entry_text();
         if text.trim().is_empty() { return; }
         let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
         let Some(conv) = conv else { return };
-        self.entry.set_text("");
+        self.entry.buffer().set_text("");
         let c = self.client.clone();
         let (tx, rx) = async_channel::bounded(1);
         let (cid, pid, t) = (conv.id.clone(), conv.default_outgoing_id.clone(), text.clone());
@@ -718,8 +733,8 @@ impl ChatsView {
         let Some(conv) = conv else { return };
         self.toast.add_toast(adw::Toast::new("Sending GIF…"));
         let (tx, rx) = async_channel::bounded(1);
-        let (c, cid, pid, caption) = (self.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), self.entry.text().to_string());
-        self.entry.set_text("");
+        let (c, cid, pid, caption) = (self.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), self.entry_text());
+        self.entry.buffer().set_text("");
         crate::rt::spawn(async move {
             let r = async {
                 let data = crate::gif::download(&url).await?;
@@ -749,7 +764,7 @@ impl ChatsView {
             let mime = gtk4::gio::content_type_guess(Some(&name), Some(data.as_slice())).0.to_string();
             me.toast.add_toast(adw::Toast::new(&format!("Sending {name}…")));
             let (tx, rx) = async_channel::bounded(1);
-            let (c, cid, pid, caption) = (me.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), me.entry.text().to_string());
+            let (c, cid, pid, caption) = (me.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), me.entry_text());
             crate::rt::spawn(async move {
                 let r = match c.upload_media(&data, &name, &mime).await {
                     Ok(media) => c.send_media(&cid, &pid, media, &caption, None).await.map(|_| ()),
@@ -757,7 +772,7 @@ impl ChatsView {
                 };
                 let _ = tx.send(r).await;
             });
-            me.entry.set_text("");
+            me.entry.buffer().set_text("");
             let me2 = me.clone();
             glib::spawn_future_local(async move {
                 match rx.recv().await {
