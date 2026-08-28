@@ -11,7 +11,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync"] }
 async-channel = "2"
 futures-util = "0.3"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "json", "query", "hickory-dns"] }
 prost = "0.14"
 prost-reflect = { version = "0.16", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

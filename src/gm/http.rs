@@ -108,13 +108,28 @@ pub fn body_pblite<M: ReflectMessage>(m: &M) -> Result<Body> { Ok(Body::PbLite(c
 pub async fn post(cli: &reqwest::Client, url: &str, body: Body, cookies: Option<(String, String)>) -> Result<reqwest::Response> {
     let (ct, bytes) = match body { Body::Proto(b) => (CT_PROTOBUF, b), Body::PbLite(b) => (CT_PBLITE, b) };
     let mut attempt = 0;
+    let started = std::time::Instant::now();
+    let path = url.rsplit('/').next().unwrap_or(url);
     loop {
         attempt += 1;
+        let t0 = std::time::Instant::now();
         let mut req = cli.post(url).headers(relay_headers(Some(ct))).body(bytes.clone());
         if let Some((c, a)) = &cookies { req = req.header("cookie", c).header("authorization", a); }
-        let resp = req.send().await.with_context(|| format!("POST {url}"))?;
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                // Name the phase (dns / connect / tls / timeout) so a stall on a flaky link is diagnosable from the log.
+                let phase = if e.is_timeout() { "timeout" } else if e.is_connect() { "connect" } else if e.is_request() { "request" } else { "other" };
+                tracing::warn!(rpc = path, attempt, phase, elapsed_ms = t0.elapsed().as_millis() as u64, "POST failed: {e}");
+                return Err(anyhow::Error::new(e)).with_context(|| format!("POST {url}"));
+            }
+        };
+        let ms = t0.elapsed().as_millis() as u64;
+        // Slow-but-successful is the interesting case (VPN flaps, resolver timeouts): keep it in the log.
+        if ms > 2000 { tracing::info!(rpc = path, attempt, status = resp.status().as_u16(), elapsed_ms = ms, "slow POST"); }
+        else { tracing::trace!(rpc = path, status = resp.status().as_u16(), elapsed_ms = ms, "POST"); }
         if resp.status().as_u16() < 500 || attempt >= 3 { return Ok(resp); }
-        tracing::debug!(url, status = %resp.status(), attempt, "server error, retrying");
+        tracing::warn!(rpc = path, status = %resp.status(), attempt, total_ms = started.elapsed().as_millis() as u64, "server error, retrying");
         tokio::time::sleep(std::time::Duration::from_secs(attempt)).await;
     }
 }

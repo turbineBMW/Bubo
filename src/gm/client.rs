@@ -35,6 +35,8 @@ pub struct Client {
     conversations_fetched: AtomicBool,
     refresh_lock: AsyncMutex<()>,
     me: std::sync::Weak<Client>,
+    /// True while a ReceiveMessages stream is open; `stream_opened` wakes waiters on each (re)open.
+    stream_open: AtomicBool,
     pub(crate) stream_opened: tokio::sync::Notify,
 }
 
@@ -60,13 +62,25 @@ impl Client {
         let c = Arc::new_cyclic(|me| Self {
             auth: Mutex::new(auth), http, lp_http,
             session: Session::default(), events: tx, listen_id: AtomicU64::new(0), skip_count: AtomicI64::new(0),
-            conversations_fetched: AtomicBool::new(false), refresh_lock: AsyncMutex::new(()), me: me.clone(), stream_opened: tokio::sync::Notify::new(),
+            conversations_fetched: AtomicBool::new(false), refresh_lock: AsyncMutex::new(()), me: me.clone(), stream_open: AtomicBool::new(false), stream_opened: tokio::sync::Notify::new(),
         });
         c.session.reset_session_id();
         Ok((c, rx))
     }
 
     pub(crate) fn emit(&self, e: Event) { let _ = self.events.try_send(e); }
+
+    /// Wait (bounded) for the ReceiveMessages stream to be open. Replies to RPCs arrive on that
+    /// stream, so sending before it exists just burns the reply timeout; the web client opens the
+    /// stream first too. Returns false if it did not open in time — callers proceed anyway, since
+    /// Google queues replies and the stream may open a moment later.
+    pub(crate) async fn wait_stream_open(&self, max: Duration) -> bool {
+        let notified = self.stream_opened.notified();
+        if self.stream_open.load(Ordering::SeqCst) { return true; }
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        tokio::time::timeout(max, notified).await.is_ok()
+    }
     pub(crate) fn is_google(&self) -> bool { self.auth.lock().unwrap().is_google() }
     fn network(&self) -> &'static str { self.auth.lock().unwrap().network() }
     /// POST through the relay, attaching Google cookies when we have them and absorbing any refreshed ones.
@@ -212,7 +226,7 @@ impl Client {
                 if let Err(e) = self.refresh_token().await {
                     let fatal = e.to_string().contains("HTTP 401") || e.to_string().contains("HTTP 403") || e.to_string().contains("HTTP 404");
                     if fatal { self.emit(Event::ListenFatal(format!("token refresh: {e:#}"))); return; }
-                    errors += 1; self.emit(Event::ListenError(format!("token refresh: {e:#}")));
+                    errors += 1; tracing::warn!(errors, "listen: token refresh: {e:#}"); self.emit(Event::ListenError(format!("token refresh: {e:#}")));
                     tokio::time::sleep(Duration::from_secs((errors + 1) * 5)).await; continue;
                 }
             }
@@ -221,21 +235,23 @@ impl Client {
                 unknown: Some(receive_messages_request::UnknownEmptyObject2 { unknown: Some(receive_messages_request::UnknownEmptyObject1 {}) }),
             };
             let body = match http::body_pblite(&payload) { Ok(b) => b, Err(e) => { tracing::error!("encode: {e:#}"); return; } };
+            let open_started = std::time::Instant::now();
             let resp = match self.post(true, &http::url_receive_messages(self.is_google()), body).await {
                 Ok(r) => r,
-                Err(e) => { errors += 1; self.emit(Event::ListenError(e.to_string())); tokio::time::sleep(Duration::from_secs((errors + 1) * 5)).await; continue; }
+                Err(e) => { errors += 1; tracing::warn!(errors, "listen: open stream: {e:#}"); self.emit(Event::ListenError(e.to_string())); tokio::time::sleep(Duration::from_secs((errors + 1) * 5)).await; continue; }
             };
             let status = resp.status().as_u16();
             if status == 401 || status == 403 {
                 let b = resp.text().await.unwrap_or_default();
                 self.emit(Event::ListenFatal(format!("HTTP {status}: {b}"))); return;
             } else if status >= 400 {
-                errors += 1; self.emit(Event::ListenError(format!("HTTP {status}")));
+                errors += 1; tracing::warn!(errors, status, "listen: open stream rejected"); self.emit(Event::ListenError(format!("HTTP {status}")));
                 tokio::time::sleep(Duration::from_secs((errors + 1) * 5)).await; continue;
             }
             if self.listen_id.load(Ordering::SeqCst) != my_id { return; }
             errors = 0;
-            tracing::debug!(listen = my_id, "long poll opened");
+            tracing::debug!(listen = my_id, open_ms = open_started.elapsed().as_millis() as u64, "long poll opened");
+            self.stream_open.store(true, Ordering::SeqCst);
             self.stream_opened.notify_waiters();
             if logged_in {
                 if first { first = false; let me = self.clone(); tokio::spawn(async move { me.post_connect().await; }); }
@@ -245,7 +261,9 @@ impl Client {
                 self.emit(Event::Connected);
             }
             self.read_stream(resp, my_id).await;
+            self.stream_open.store(false, Ordering::SeqCst);
             disconnected_at = Some(std::time::Instant::now());
+            tracing::info!(listen = my_id, lived_s = open_started.elapsed().as_secs(), "long poll closed");
         }
     }
 
@@ -440,6 +458,9 @@ impl Client {
             dest_registration_i_ds: dest.into_iter().collect(),
         };
         let rx = if opts.expect_response { Some(self.session.wait_for(&request_id)) } else { None };
+        if opts.expect_response && !self.wait_stream_open(Duration::from_secs(15)).await {
+            tracing::warn!(?action, %request_id, "sending with no open ReceiveMessages stream");
+        }
         tracing::debug!(?action, %request_id, "→ phone");
         let sent: Result<OutgoingRpcResponse> = async { http::parse(self.post(false, &http::url_send_message(self.is_google()), http::body_pblite(&msg)?).await?).await }.await;
         if let Err(e) = sent { self.session.cancel(&request_id); return Err(e); }
