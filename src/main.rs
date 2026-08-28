@@ -1,4 +1,5 @@
 mod accent;
+mod gif;
 mod gm;
 mod notify;
 mod settings;

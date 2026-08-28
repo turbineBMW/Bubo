@@ -56,6 +56,7 @@ pub struct ChatsView {
     entry: gtk4::Entry,
     send: gtk4::Button,
     attach: gtk4::Button,
+    gif_btn: gtk4::Button,
     toast: adw::ToastOverlay,
     banner: adw::Banner,
     side_stack: gtk4::Stack,
@@ -140,8 +141,9 @@ impl ChatsView {
             .secondary_icon_name("emoji-people-symbolic").secondary_icon_activatable(true).secondary_icon_tooltip_text("Insert emoji").build();
         let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).build();
         let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").build();
+        let gif_btn = gtk4::Button::builder().label("GIF").css_classes(["circular", "bubo-gif-btn"]).tooltip_text("Send a GIF").build();
         let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).build();
-        composer.append(&attach); composer.append(&entry); composer.append(&send);
+        composer.append(&attach); composer.append(&gif_btn); composer.append(&entry); composer.append(&send);
         composer.set_visible(false);
         let banner = adw::Banner::builder().revealed(false).build();
         let content_empty = adw::StatusPage::builder().icon_name("user-available-symbolic").title("Select a conversation").description("Pick a chat from the list to start messaging.").build();
@@ -162,6 +164,9 @@ impl ChatsView {
             .bubo-me { background: var(--accent-bg-color); color: var(--accent-fg-color); }
             .bubo-them { background: alpha(currentColor, 0.08); }
             .bubo-image { border-radius: 16px; }
+            .bubo-gif-btn { font-size: 0.7em; font-weight: bold; padding: 0 6px; }
+            .bubo-gif-tile { padding: 0; border-radius: 8px; }
+            .bubo-gif-tile picture { border-radius: 8px; }
             .bubo-thread row { background: transparent; border: none; box-shadow: none; padding: 0; margin: 2px 0; }
             .bubo-meta { font-size: 0.8em; opacity: 0.7; }
             .bubo-snippet { opacity: 0.7; }
@@ -173,7 +178,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, toast, banner, side_stack, content_stack, composer,
+        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
             settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
@@ -227,6 +232,7 @@ impl ChatsView {
         self.send.connect_clicked(move |_| me.send_current());
         let me = self.clone();
         self.attach.connect_clicked(move |_| me.pick_and_send());
+        self.build_gif_picker();
         // emoji picker: GTK's own chooser, anchored to the entry's trailing icon, inserting at the cursor
         let chooser = gtk4::EmojiChooser::new();
         chooser.set_parent(&self.entry);
@@ -624,6 +630,110 @@ impl ChatsView {
 }
 
 impl ChatsView {
+    /// GIF search popover on the composer's GIF button: a debounced DuckDuckGo search filling a
+    /// grid of thumbnails; clicking one downloads the GIF and sends it like any attachment.
+    fn build_gif_picker(self: &Rc<Self>) {
+        let pop = gtk4::Popover::builder().width_request(372).build();
+        pop.set_parent(&self.gif_btn);
+        let search = gtk4::SearchEntry::builder().placeholder_text("Search GIFs").build();
+        let grid = gtk4::FlowBox::builder().selection_mode(gtk4::SelectionMode::None).min_children_per_line(3).max_children_per_line(3)
+            .homogeneous(true).row_spacing(4).column_spacing(4).valign(gtk4::Align::Start).build();
+        let scroll = gtk4::ScrolledWindow::builder().child(&grid).hscrollbar_policy(gtk4::PolicyType::Never).height_request(400).build();
+        let status = gtk4::Label::builder().label("Type to search").css_classes(["dim-label"]).margin_top(12).margin_bottom(12).build();
+        let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).build();
+        col.append(&search); col.append(&status); col.append(&scroll);
+        pop.set_child(Some(&col));
+        let s = search.clone();
+        pop.connect_show(move |_| { s.grab_focus(); });
+        let p = pop.clone();
+        self.gif_btn.connect_clicked(move |_| p.popup());
+
+        // Each keystroke bumps the generation; a query only runs (and its results only land) if it
+        // is still the latest one 350ms later.
+        let generation = Rc::new(Cell::new(0u64));
+        let me = self.clone();
+        let grid2 = grid.clone();
+        search.connect_search_changed(move |e| {
+            let grid = &grid2;
+            let query = e.text().to_string();
+            generation.set(generation.get() + 1);
+            let my_gen = generation.get();
+            if query.trim().is_empty() { status.set_label("Type to search"); status.set_visible(true); Self::clear_flow(grid); return; }
+            let (generation, status, grid, me) = (generation.clone(), status.clone(), grid.clone(), me.clone());
+            glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
+                if generation.get() != my_gen { return; }
+                status.set_label("Searching…"); status.set_visible(true);
+                let (tx, rx) = async_channel::bounded(1);
+                crate::rt::spawn(async move { let _ = tx.send(crate::gif::search(&query, 0).await).await; });
+                glib::spawn_future_local(async move {
+                    let Ok(res) = rx.recv().await else { return };
+                    if generation.get() != my_gen { return; }
+                    Self::clear_flow(&grid);
+                    match res {
+                        Ok(gifs) if gifs.is_empty() => status.set_label("No GIFs found"),
+                        Ok(gifs) => { status.set_visible(false); for g in gifs.into_iter().take(45) { grid.append(&me.gif_tile(g)); } }
+                        Err(e) => status.set_label(&format!("{e:#}")),
+                    }
+                });
+            });
+        });
+        let p = pop.clone();
+        // Popover clicks route via the tile's stored URL; close the popover once a GIF is chosen.
+        let me = self.clone();
+        grid.connect_child_activated(move |_, child| {
+            let Some(url) = (unsafe { child.child().and_then(|c| c.data::<String>("gif-url")).map(|u| u.as_ref().clone()) }) else { return };
+            p.popdown();
+            me.send_gif(url);
+        });
+    }
+
+    fn clear_flow(grid: &gtk4::FlowBox) {
+        while let Some(c) = grid.first_child() { grid.remove(&c); }
+    }
+
+    /// A grid tile: a fixed-size picture whose thumbnail loads in the background.
+    fn gif_tile(self: &Rc<Self>, g: crate::gif::Gif) -> gtk4::Widget {
+        let pic = gtk4::Picture::builder().content_fit(gtk4::ContentFit::Cover).can_shrink(true).overflow(gtk4::Overflow::Hidden).build();
+        pic.set_size_request(112, 112);
+        let btn = gtk4::Button::builder().child(&pic).css_classes(["flat", "bubo-gif-tile"]).tooltip_text(&g.url).build();
+        unsafe { btn.set_data("gif-url", g.url.clone()); }
+        let thumb = g.thumbnail.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        crate::rt::spawn(async move { let _ = tx.send(crate::gif::thumbnail(&thumb).await).await; });
+        let weak = pic.downgrade();
+        glib::spawn_future_local(async move {
+            let Ok(Ok(bytes)) = rx.recv().await else { return };
+            let Some(pic) = weak.upgrade() else { return };
+            if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&bytes)) { pic.set_paintable(Some(&tex)); }
+        });
+        // FlowBox activates the child on click; the button itself just needs to not swallow it.
+        let btn2 = btn.clone();
+        btn.connect_clicked(move |_| { if let Some(child) = btn2.parent().and_downcast::<gtk4::FlowBoxChild>() { child.activate(); } });
+        btn.upcast()
+    }
+
+    /// Download a GIF by URL, upload it, and send it (with any composer text as caption).
+    fn send_gif(self: &Rc<Self>, url: String) {
+        let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
+        let Some(conv) = conv else { return };
+        self.toast.add_toast(adw::Toast::new("Sending GIF…"));
+        let (tx, rx) = async_channel::bounded(1);
+        let (c, cid, pid, caption) = (self.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), self.entry.text().to_string());
+        self.entry.set_text("");
+        crate::rt::spawn(async move {
+            let r = async {
+                let data = crate::gif::download(&url).await?;
+                let media = c.upload_media(&data, "animation.gif", "image/gif").await?;
+                c.send_media(&cid, &pid, media, &caption, None).await.map(|_| ())
+            }.await;
+            let _ = tx.send(r).await;
+        });
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Err(e)) = rx.recv().await { me.toast.add_toast(adw::Toast::new(&format!("GIF send failed: {e:#}"))); }
+        });
+    }
+
     /// Open a file chooser, upload the chosen file, and send it to the open conversation.
     fn pick_and_send(self: &Rc<Self>) {
         let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
