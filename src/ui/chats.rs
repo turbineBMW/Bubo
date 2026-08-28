@@ -136,7 +136,8 @@ impl ChatsView {
         thread.add_css_class("bubo-thread");
         let thread_scroll = gtk4::ScrolledWindow::builder().child(&thread).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
         let thread_title = adw::WindowTitle::new("", "");
-        let entry = gtk4::Entry::builder().placeholder_text("Message").hexpand(true).build();
+        let entry = gtk4::Entry::builder().placeholder_text("Message").hexpand(true)
+            .secondary_icon_name("emoji-people-symbolic").secondary_icon_activatable(true).secondary_icon_tooltip_text("Insert emoji").build();
         let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).build();
         let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").build();
         let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).build();
@@ -226,6 +227,32 @@ impl ChatsView {
         self.send.connect_clicked(move |_| me.send_current());
         let me = self.clone();
         self.attach.connect_clicked(move |_| me.pick_and_send());
+        // emoji picker: GTK's own chooser, anchored to the entry's trailing icon, inserting at the cursor
+        let chooser = gtk4::EmojiChooser::new();
+        chooser.set_parent(&self.entry);
+        let entry = self.entry.clone();
+        chooser.connect_emoji_picked(move |_, e| {
+            entry.delete_selection();
+            let mut pos = entry.position();
+            entry.insert_text(e, &mut pos);
+            entry.set_position(pos);
+        });
+        let entry = self.entry.clone();
+        // On close GTK hands focus back to the entry with its own grab_focus(), which select-alls;
+        // collapse that selection to the caret once it has happened.
+        chooser.connect_hide(move |_| {
+            let entry = entry.clone();
+            glib::idle_add_local_once(move || {
+                entry.grab_focus_without_selecting();
+                let p = entry.position();
+                entry.select_region(p, p);
+            });
+        });
+        self.entry.connect_icon_press(move |e, pos| {
+            if pos != gtk4::EntryIconPosition::Secondary { return; }
+            chooser.set_pointing_to(Some(&e.icon_area(pos)));
+            chooser.popup();
+        });
         // typing indicator: notify the phone (throttled) while the user types
         let me = self.clone();
         let last = Rc::new(RefCell::new(std::time::Instant::now() - std::time::Duration::from_secs(10)));
