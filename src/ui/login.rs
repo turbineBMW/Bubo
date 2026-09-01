@@ -76,6 +76,14 @@ impl EmojiPage {
         self.widget.set_child(Some(&l));
     }
     pub fn error(&self, e: &str) { self.widget.set_title("Pairing failed"); self.widget.set_description(Some(&gtk4::glib::markup_escape_text(e))); self.widget.set_child(None::<&gtk4::Widget>); }
+    /// Like `error`, with a button that runs `retry`.
+    pub fn error_with_retry(&self, e: &str, retry: impl Fn() + 'static) {
+        self.error(e);
+        let b = gtk4::Button::builder().label("Try again").css_classes(["pill", "suggested-action"]).halign(gtk4::Align::Center).build();
+        b.connect_clicked(move |_| retry());
+        self.widget.set_child(Some(&b));
+    }
+    pub fn signing_in(&self) { self.widget.set_title("Signing in…"); self.widget.set_description(None); self.widget.set_child(Some(&adw::Spinner::new())); }
     pub fn paired(&self) { self.widget.set_title("Paired!"); self.widget.set_description(Some("Connecting…")); self.widget.set_child(None::<&gtk4::Widget>); }
 }
 

@@ -13,6 +13,9 @@ pub enum Event {
     ListenError(String),
     /// Fatal (401/403): needs re-pairing.
     ListenFatal(String),
+    /// The phone expired this Google-account pairing (periodic re-verification). The Google
+    /// cookies are still good: re-run the emoji pairing, no sign-in needed.
+    SessionExpired,
     PhoneNotResponding,
     PhoneRespondingAgain,
     Conversation(conversations::Conversation),

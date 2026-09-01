@@ -77,6 +77,7 @@ async fn cli_login() -> anyhow::Result<()> {
         match tokio::time::timeout(std::time::Duration::from_secs(30), events.recv()).await?? {
             gm::events::Event::Connected => { println!("connected"); return Ok(()); }
             gm::events::Event::ListenFatal(e) => anyhow::bail!("{e}"),
+            gm::events::Event::SessionExpired => anyhow::bail!("the phone expired this pairing; open Bubo to pick the emoji again"),
             _ => {}
         }
     }
@@ -91,6 +92,7 @@ async fn connected() -> anyhow::Result<(std::sync::Arc<gm::client::Client>, asyn
         match tokio::time::timeout(std::time::Duration::from_secs(30), events.recv()).await?? {
             gm::events::Event::Connected => break,
             gm::events::Event::ListenFatal(e) => anyhow::bail!("{e}"),
+            gm::events::Event::SessionExpired => anyhow::bail!("the phone expired this pairing; open Bubo to pick the emoji again"),
             e => tracing::debug!(?e, "event"),
         }
     }
