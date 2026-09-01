@@ -38,6 +38,10 @@ RUST_LOG=bubo=debug cargo run -- probe   # see every RPC
 When the emoji appears, the phone shows a notification from Messages asking you to
 confirm a new device — pick the matching emoji there.
 
+Every so often the phone expires a Google-account pairing (the web client asks you to
+pick an emoji again). Bubo does the same: it keeps the Google cookies, drops the pairing
+and goes straight back to the emoji page — no sign-in needed unless the cookies are dead too.
+
 ## How the protocol works
 
 Google-account (emoji) pairing and message sync verified live end-to-end 2026-08-27.
