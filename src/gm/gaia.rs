@@ -120,6 +120,9 @@ impl PairingSession {
 /// `Arrays.hashCode` for signed bytes — the phone sorts keys by this.
 fn java_hash(b: &[u8]) -> i32 { b.iter().fold(1i32, |h, &x| h.wrapping_mul(31).wrapping_add(x as i8 as i32)) }
 
+/// Field 8 of GaiaPairingRequestContainer. The phone checks for this exact text on CLIENT_FINISHED.
+const PRIVATE_API_CONFIRMATION: &str = "This is an undocumented API. Use or access of undocumented Google APIs without express authorization is prohibited per the Google API Terms of Service (https://developers.google.com/terms).";
+
 impl Client {
     fn base_sign_in(&self) -> Result<SignInGaiaRequest> {
         let sid = self.auth.lock().unwrap().session_id.clone().ok_or_else(|| anyhow!("no session id; fetch config first"))?;
@@ -190,6 +193,8 @@ impl Client {
                 E::UserCanceledVerification => "pairing was cancelled on the phone".to_string(),
                 E::UserDeniedVerificationNotMe => "pairing was denied on the phone ('this is not me')".to_string(),
                 E::RequestOutOfDate | E::RequestNotReceivedQuickly | E::VerificationTimedOut => "pairing timed out".to_string(),
+                E::ClientAttestationMissing | E::ClientAttestationMismatch | E::ClientAttestationRevisionMismatch =>
+                    format!("the phone rejected Bubo's pairing attestation ({code:?}) — the Messages app probably changed the protocol again; Bubo needs an update"),
                 other => format!("pairing failed: {other:?} ({}/{})", resp.finish_error_type, resp.finish_error_code),
             });
         }
@@ -212,6 +217,8 @@ impl Client {
         let req = GaiaPairingRequestContainer {
             pairing_attempt_id: ps.id.clone(), browser_details: Some(browser_details()), start_timestamp: ps.start_ms, data,
             proposed_verification_code_version: if finish { 0 } else { 1 }, proposed_key_derivation_version: if finish { 0 } else { 1 },
+            // Since late Aug 2026 the phone rejects CLIENT_FINISHED with CLIENT_ATTESTATION_MISSING unless this exact string is present.
+            private_api_confirmation: if finish { PRIVATE_API_CONFIRMATION.into() } else { String::new() },
         };
         let opts = SendOpts { dont_encrypt: true, custom_ttl: Some(300_000_000), message_type: if finish { MessageType::BugleMessage } else { MessageType::Gaia2 },
             timeout: Duration::from_secs(if finish { 330 } else { 25 }), ..Default::default() };

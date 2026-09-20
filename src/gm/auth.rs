@@ -52,6 +52,9 @@ impl AuthData {
         Self { request_crypto: RequestCrypto::generate(), refresh_key: RefreshKey::generate(), browser: None, mobile: None,
                tachyon_token: vec![], tachyon_expiry: 0, tachyon_ttl: 0, cookies: Default::default(), dest_reg_id: None, pairing_id: None, session_id: None }
     }
+    /// Fresh pairing state that keeps only the Google cookies: what a re-pair after the phone
+    /// expired the session starts from.
+    pub fn for_repair(&self) -> Self { let mut a = Self::new(); a.cookies = self.cookies.clone(); a }
     pub fn load() -> Result<Option<Self>> {
         match std::fs::read(path()) { Ok(b) => Ok(Some(serde_json::from_slice(&b)?)), Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None), Err(e) => Err(e.into()) }
     }

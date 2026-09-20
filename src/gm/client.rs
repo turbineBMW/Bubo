@@ -362,7 +362,8 @@ impl Client {
         if self.skip_count.load(Ordering::SeqCst) > 0 { self.skip_count.fetch_sub(1, Ordering::SeqCst); msg.is_old = true; }
         if msg.action() != ActionType::GetUpdates { tracing::debug!(action = ?msg.action(), "unsolicited response"); return; }
         if msg.decrypted.is_none() && msg.message.as_ref().map(|m| m.unencrypted_data == [0x72, 0x00]).unwrap_or(false) {
-            self.emit(Event::ListenFatal("Google signed this session out".into())); return;
+            tracing::info!("phone reports this pairing expired; re-pairing needed");
+            self.emit(Event::SessionExpired); return;
         }
         let Some(dec) = &msg.decrypted else { return };
         let ev = match UpdateEvents::decode(dec.as_slice()) { Ok(e) => e, Err(e) => { tracing::warn!("UpdateEvents decode: {e}"); return; } };

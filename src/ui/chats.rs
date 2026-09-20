@@ -41,6 +41,8 @@ pub struct ChatsView {
     win: adw::ApplicationWindow,
     client: Arc<Client>,
     events: async_channel::Receiver<Event>,
+    /// Set by the app: tears this view down and re-runs the emoji pairing.
+    on_session_expired: RefCell<Option<Box<dyn Fn()>>>,
     st: Rc<RefCell<State>>,
     list: gtk4::ListBox,
     thread: gtk4::ListBox,
@@ -195,7 +197,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
+        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
             settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
@@ -207,6 +209,8 @@ impl ChatsView {
         win.application().unwrap().add_action(&unpair);
         v
     }
+
+    pub fn set_on_session_expired(&self, f: impl Fn() + 'static) { *self.on_session_expired.borrow_mut() = Some(Box::new(f)); }
 
     pub fn start(self: &Rc<Self>) {
         {
@@ -307,6 +311,13 @@ impl ChatsView {
             Event::PhoneRespondingAgain | Event::Connected => self.banner.set_revealed(false),
             Event::ListenError(e) => { self.banner.set_title(&format!("Connection trouble: {e}")); self.banner.set_revealed(true); }
             Event::ListenFatal(e) => { self.banner.set_title(&format!("Disconnected: {e}. Run `bubo unpair` and pair again.")); self.banner.set_revealed(true); }
+            Event::SessionExpired => {
+                self.banner.set_title("Google expired this pairing — pick the emoji again to reconnect."); self.banner.set_revealed(true);
+                // Take it: the phone answers every poll this way until we disconnect, and
+                // re-entering the teardown would restart a re-pair that is already running.
+                let cb = self.on_session_expired.borrow_mut().take();
+                if let Some(cb) = cb { cb(); }
+            }
             Event::Unpaired => { self.banner.set_title("This device was unpaired from the phone."); self.banner.set_revealed(true); let _ = std::fs::remove_file(crate::gm::auth::path()); }
             Event::Typing(t) => {
                 let cur = self.st.borrow().current.clone();
