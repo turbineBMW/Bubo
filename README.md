@@ -42,6 +42,17 @@ Every so often the phone expires a Google-account pairing (the web client asks y
 pick an emoji again). Bubo does the same: it keeps the Google cookies, drops the pairing
 and goes straight back to the emoji page — no sign-in needed unless the cookies are dead too.
 
+## Appearance
+
+Bubo follows the active Omarchy theme by default, including its palette and light
+or dark mode. Desktop theme changes apply live. Turn off **Preferences → Appearance
+→ Follow Omarchy theme** to use the system libadwaita appearance instead. Outside
+Omarchy, Bubo uses the system appearance automatically.
+
+Like Rustle, Bubo reads `~/.local/state/omarchy/current/theme/colors.toml`.
+A theme can provide `bubo.css` to replace the generated colors, including through
+an Omarchy template at `~/.config/omarchy/themed/bubo.css.tpl`.
+
 ## How the protocol works
 
 Google-account (emoji) pairing and message sync verified live end-to-end 2026-08-27.

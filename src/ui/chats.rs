@@ -178,7 +178,7 @@ impl ChatsView {
             .bubo-me { background: var(--accent-bg-color); color: var(--accent-fg-color); }
             .bubo-them { background: alpha(currentColor, 0.08); }
             .bubo-image { border-radius: 16px; }
-            .bubo-entry-frame { border-radius: 18px; border: 1px solid alpha(currentColor, 0.15); background: alpha(currentColor, 0.05); }
+            .bubo-entry-frame { border-radius: 18px; border: 1px solid color-mix(in srgb, currentColor var(--border-opacity), transparent); background: alpha(currentColor, 0.05); }
             .bubo-entry-frame:focus-within { border-color: var(--accent-bg-color); }
             .bubo-entry, .bubo-entry text { background: transparent; }
             /* the scrolled window otherwise reserves the scrollbar slider's 40px minimum, so an empty composer would start two lines tall */
@@ -988,6 +988,21 @@ impl ChatsView {
         use crate::settings::Sound;
         let dialog = adw::PreferencesDialog::new();
         let page = adw::PreferencesPage::new();
+        let appearance = adw::PreferencesGroup::builder().title("Appearance").build();
+        let follow = adw::SwitchRow::builder().title("Follow Omarchy theme")
+            .subtitle(crate::omarchy::theme_name().map(|name| format!("Match the desktop colors · {name}"))
+                .unwrap_or_else(|| "Match the desktop colors".into()))
+            .active(self.settings.borrow().follow_omarchy_theme).build();
+        let me = self.clone();
+        follow.connect_active_notify(move |row| {
+            let mut settings = me.settings.borrow_mut();
+            settings.follow_omarchy_theme = row.is_active();
+            settings.save();
+            crate::omarchy::set_follow(row.is_active());
+        });
+        appearance.add(&follow);
+        appearance.set_visible(crate::omarchy::detected());
+        page.add(&appearance);
         let group = adw::PreferencesGroup::builder().title("Notifications")
             .description("The sound is requested from your notification daemon, which decides whether to play it — so do-not-disturb rules in your shell still apply.").build();
         let choices = gtk4::StringList::new(&["System default", "Custom file", "None"]);

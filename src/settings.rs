@@ -17,10 +17,17 @@ pub enum Sound {
     None,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub notification_sound: Sound,
+    pub follow_omarchy_theme: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self { notification_sound: Sound::default(), follow_omarchy_theme: true }
+    }
 }
 
 pub fn path() -> PathBuf {
@@ -37,5 +44,22 @@ impl Settings {
         if let Err(e) = serde_json::to_vec_pretty(self).map_err(anyhow::Error::from).and_then(|b| std::fs::write(&p, b).map_err(Into::into)) {
             tracing::warn!("saving settings: {e:#}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_preferences_follow_omarchy_and_preserve_sound() {
+        let settings: Settings = serde_json::from_str(r#"{"notification_sound":{"kind":"none"}}"#).unwrap();
+        assert!(settings.follow_omarchy_theme);
+        assert_eq!(settings.notification_sound, Sound::None);
+        let opted_out = Settings { follow_omarchy_theme: false, ..settings };
+        let saved = serde_json::to_string(&opted_out).unwrap();
+        let loaded: Settings = serde_json::from_str(&saved).unwrap();
+        assert!(!loaded.follow_omarchy_theme);
+        assert_eq!(loaded.notification_sound, Sound::None);
     }
 }
