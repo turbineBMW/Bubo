@@ -2,6 +2,7 @@ mod accent;
 mod gif;
 mod gm;
 mod notify;
+mod omarchy;
 mod settings;
 mod rt;
 mod ui;
@@ -23,6 +24,12 @@ fn main() -> anyhow::Result<()> {
         _ => {}
     }
     let app = adw::Application::builder().application_id(APP_ID).flags(gtk4::gio::ApplicationFlags::NON_UNIQUE).build();
+    app.connect_startup(|_| {
+        if let Some(display) = gtk4::gdk::Display::default() {
+            accent::install_fallback(&display);
+            omarchy::install(&display);
+        }
+    });
     app.connect_activate(|app| { gtk4::Window::set_default_icon_name(APP_ID); ui::build(app); });
     app.run_with_args::<&str>(&[]);
     Ok(())
