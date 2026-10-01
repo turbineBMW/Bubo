@@ -65,6 +65,10 @@ pub struct ChatsView {
     side_stack: gtk4::Stack,
     content_stack: gtk4::Stack,
     composer: gtk4::Box,
+    /// Tray above the composer bar showing staged attachments; hidden while empty.
+    pending_box: gtk4::Box,
+    /// Attachments staged by pasting, sent with the next message.
+    pending: RefCell<Vec<Pending>>,
     settings: Rc<RefCell<crate::settings::Settings>>,
     notifier: Option<Rc<crate::notify::Notifier>>,
     /// The "+" in the sidebar header that opens the new-conversation picker.
@@ -72,6 +76,18 @@ pub struct ChatsView {
     /// The phone's address book, fetched on first use of the picker and kept for the session.
     contacts: Rc<RefCell<Option<Rc<Vec<ContactEntry>>>>>,
 }
+
+/// A file waiting in the composer tray until the next send.
+struct Pending {
+    data: Vec<u8>,
+    name: String,
+    mime: String,
+    tile: gtk4::Widget,
+}
+
+/// Clipboard image types read verbatim, so a pasted GIF stays animated and a JPEG isn't
+/// re-encoded; any other image the clipboard offers goes through a texture and becomes PNG.
+const PASTE_IMAGE_MIMES: &[&str] = &["image/png", "image/jpeg", "image/gif", "image/webp"];
 
 /// One address-book entry as the picker shows it.
 #[derive(Clone, Debug)]
@@ -156,8 +172,11 @@ impl ChatsView {
         let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).valign(gtk4::Align::End).tooltip_text("Send (Ctrl+Enter)").build();
         let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").valign(gtk4::Align::End).build();
         let gif_btn = gtk4::Button::builder().label("GIF").css_classes(["circular", "bubo-gif-btn"]).tooltip_text("Send a GIF").valign(gtk4::Align::End).build();
-        let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).valign(gtk4::Align::End).build();
-        composer.append(&attach); composer.append(&gif_btn); composer.append(&emoji_btn); composer.append(&entry_scroll); composer.append(&send);
+        let bar = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).build();
+        bar.append(&attach); bar.append(&gif_btn); bar.append(&emoji_btn); bar.append(&entry_scroll); bar.append(&send);
+        let pending_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).visible(false).build();
+        let composer = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).margin_start(12).margin_end(12).margin_top(6).margin_bottom(12).valign(gtk4::Align::End).build();
+        composer.append(&pending_box); composer.append(&bar);
         composer.set_visible(false);
         let banner = adw::Banner::builder().revealed(false).build();
         let content_empty = adw::StatusPage::builder().icon_name("user-available-symbolic").title("Select a conversation").description("Pick a chat from the list to start messaging.").build();
@@ -186,6 +205,8 @@ impl ChatsView {
             .bubo-gif-btn { font-size: 0.7em; font-weight: bold; padding: 0 6px; }
             .bubo-gif-tile { padding: 0; border-radius: 8px; }
             .bubo-gif-tile picture { border-radius: 8px; }
+            .bubo-pending-tile { border-radius: 10px; }
+            .bubo-pending-remove { margin: 4px; min-width: 22px; min-height: 22px; padding: 0; }
             .bubo-thread row { background: transparent; border: none; box-shadow: none; padding: 0; margin: 2px 0; }
             .bubo-meta { font-size: 0.8em; opacity: 0.7; }
             .bubo-snippet { opacity: 0.7; }
@@ -198,7 +219,7 @@ impl ChatsView {
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
         let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
-            settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
+            pending_box, pending: RefCell::default(), settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         let unpair = gtk4::gio::SimpleAction::new("unpair", None);
         let c = v.client.clone(); let w = win.clone();
         unpair.connect_activate(move |_, _| {
@@ -254,6 +275,19 @@ impl ChatsView {
             if enter && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) { me.send_current(); glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
         self.entry.add_controller(keys);
+        // Paste with files or an image on the clipboard stages them as attachments, like Messages
+        // for Web. Text wins when the clipboard also offers it (a spreadsheet cell copies as an
+        // image too), except for a file list, which file managers pair with the paths as text.
+        let me = self.clone();
+        self.entry.connect_paste_clipboard(move |tv| {
+            let cb = tv.clipboard();
+            let f = cb.formats().union_deserialize_types();
+            let files = f.contains_type(gtk4::gdk::FileList::static_type());
+            let image = !f.contains_type(glib::Type::STRING) && f.contains_type(gtk4::gdk::Texture::static_type());
+            if !files && !image { return; }
+            tv.stop_signal_emission_by_name("paste-clipboard");
+            me.paste_attachments(cb, files);
+        });
         let me = self.clone();
         self.send.connect_clicked(move |_| me.send_current());
         let me = self.clone();
@@ -635,10 +669,12 @@ impl ChatsView {
 
     fn send_current(self: &Rc<Self>) {
         let text = self.entry_text();
-        if text.trim().is_empty() { return; }
+        let has_pending = !self.pending.borrow().is_empty();
+        if text.trim().is_empty() && !has_pending { return; }
         let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
         let Some(conv) = conv else { return };
         self.entry.buffer().set_text("");
+        if has_pending { self.send_pending(conv, text); return; }
         let c = self.client.clone();
         let (tx, rx) = async_channel::bounded(1);
         let (cid, pid, t) = (conv.id.clone(), conv.default_outgoing_id.clone(), text.clone());
@@ -757,6 +793,130 @@ impl ChatsView {
         let me = self.clone();
         glib::spawn_future_local(async move {
             if let Ok(Err(e)) = rx.recv().await { me.toast.add_toast(adw::Toast::new(&format!("GIF send failed: {e:#}"))); }
+        });
+    }
+
+    /// Read files or an image off the clipboard into the composer tray.
+    fn paste_attachments(self: &Rc<Self>, cb: gtk4::gdk::Clipboard, files: bool) {
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            let got = if files { Self::clipboard_files(&cb).await } else { Self::clipboard_image(&cb).await };
+            match got {
+                Ok(items) if !items.is_empty() => for (data, name, mime) in items { me.stage_attachment(data, name, mime); },
+                // e.g. a uri-list of web links: nothing local to attach, so paste it as text after all
+                Ok(_) => if let Ok(Some(t)) = cb.read_text_future().await {
+                    let b = me.entry.buffer();
+                    b.delete_selection(true, true);
+                    b.insert_at_cursor(&t);
+                },
+                Err(e) => me.toast.add_toast(adw::Toast::new(&format!("Could not paste: {e:#}"))),
+            }
+        });
+    }
+
+    /// Local files from a copied file list (non-local URIs and directories are skipped).
+    async fn clipboard_files(cb: &gtk4::gdk::Clipboard) -> anyhow::Result<Vec<(Vec<u8>, String, String)>> {
+        let v = cb.read_value_future(gtk4::gdk::FileList::static_type(), glib::Priority::DEFAULT).await?;
+        let list = v.get::<gtk4::gdk::FileList>().map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut out = Vec::new();
+        for path in list.files().iter().filter_map(|f| f.path()).filter(|p| p.is_file()) {
+            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+            let data = std::fs::read(&path).map_err(|e| anyhow::anyhow!("{name}: {e}"))?;
+            let mime = gtk4::gio::content_type_guess(Some(&name), Some(data.as_slice())).0.to_string();
+            out.push((data, name, mime));
+        }
+        Ok(out)
+    }
+
+    /// The clipboard image, as its original bytes when it's a type we can send as-is.
+    async fn clipboard_image(cb: &gtk4::gdk::Clipboard) -> anyhow::Result<Vec<(Vec<u8>, String, String)>> {
+        if let Ok((stream, mime)) = cb.read_future(PASTE_IMAGE_MIMES, glib::Priority::DEFAULT).await {
+            let mut data = Vec::new();
+            loop {
+                let chunk = stream.read_bytes_future(64 * 1024, glib::Priority::DEFAULT).await?;
+                if chunk.is_empty() { break; }
+                data.extend_from_slice(&chunk);
+            }
+            let ext = mime.strip_prefix("image/").unwrap_or("png");
+            return Ok(vec![(data, format!("pasted.{ext}"), mime.to_string())]);
+        }
+        let Some(tex) = cb.read_texture_future().await? else { anyhow::bail!("clipboard has no image") };
+        Ok(vec![(tex.save_to_png_bytes().to_vec(), "pasted.png".into(), "image/png".into())])
+    }
+
+    /// Add a file to the composer tray: a thumbnail for images, an icon and name otherwise.
+    fn stage_attachment(self: &Rc<Self>, data: Vec<u8>, name: String, mime: String) {
+        let thumb = if mime.starts_with("image/") { Self::square_thumbnail(&data, 160) } else { None };
+        let preview: gtk4::Widget = match thumb {
+            // An Image draws at its pixel size whatever the paintable's own size; a Picture would
+            // ask for the full image dimensions and blow the tray up.
+            Some(tex) => gtk4::Image::builder().paintable(&tex).pixel_size(80).overflow(gtk4::Overflow::Hidden)
+                .css_classes(["bubo-pending-tile"]).build().upcast(),
+            None => {
+                let b = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(4).valign(gtk4::Align::Center).css_classes(["card", "bubo-pending-tile"]).build();
+                b.append(&gtk4::Image::builder().gicon(&gtk4::gio::content_type_get_symbolic_icon(&mime)).pixel_size(24).margin_top(8).build());
+                b.append(&gtk4::Label::builder().label(&name).ellipsize(gtk4::pango::EllipsizeMode::Middle).max_width_chars(8).margin_start(4).margin_end(4).css_classes(["caption"]).build());
+                b.upcast()
+            }
+        };
+        preview.set_size_request(80, 80);
+        preview.set_tooltip_text(Some(&name));
+        let overlay = gtk4::Overlay::builder().child(&preview).build();
+        let remove = gtk4::Button::builder().icon_name("window-close-symbolic").css_classes(["circular", "osd", "bubo-pending-remove"])
+            .halign(gtk4::Align::End).valign(gtk4::Align::Start).tooltip_text("Remove").build();
+        overlay.add_overlay(&remove);
+        let tile: gtk4::Widget = overlay.upcast();
+        let me = self.clone();
+        let t = tile.clone();
+        remove.connect_clicked(move |_| {
+            me.pending.borrow_mut().retain(|p| p.tile != t);
+            me.pending_box.remove(&t);
+            me.pending_box.set_visible(!me.pending.borrow().is_empty());
+            me.entry.grab_focus();
+        });
+        self.pending_box.append(&tile);
+        self.pending_box.set_visible(true);
+        self.pending.borrow_mut().push(Pending { data, name, mime, tile });
+    }
+
+    /// A centre-cropped `side`×`side` texture of an image, for tray tiles (2× the tile size so it
+    /// stays sharp on HiDPI). GIFs give their first frame.
+    fn square_thumbnail(data: &[u8], side: i32) -> Option<gtk4::gdk::Texture> {
+        let stream = gtk4::gio::MemoryInputStream::from_bytes(&glib::Bytes::from(data));
+        let pb = gtk4::gdk_pixbuf::Pixbuf::from_stream(&stream, None::<&gtk4::gio::Cancellable>).ok()?;
+        let (w, h) = (pb.width(), pb.height());
+        let s = w.min(h);
+        let sq = pb.new_subpixbuf((w - s) / 2, (h - s) / 2, s, s);
+        let scaled = sq.scale_simple(side, side, gtk4::gdk_pixbuf::InterpType::Bilinear)?;
+        Some(gtk4::gdk::Texture::for_pixbuf(&scaled))
+    }
+
+    /// Upload and send everything in the tray, in order; the composer text rides as the caption
+    /// on the last one so it lands beneath the pictures.
+    fn send_pending(self: &Rc<Self>, conv: Conv, text: String) {
+        let items: Vec<(Vec<u8>, String, String)> = self.pending.borrow_mut().drain(..).map(|p| {
+            self.pending_box.remove(&p.tile);
+            (p.data, p.name, p.mime)
+        }).collect();
+        self.pending_box.set_visible(false);
+        let n = items.len();
+        self.toast.add_toast(adw::Toast::new(&if n == 1 { format!("Sending {}…", items[0].1) } else { format!("Sending {n} attachments…") }));
+        let caption = if text.trim().is_empty() { String::new() } else { text };
+        let (tx, rx) = async_channel::bounded(1);
+        let (c, cid, pid) = (self.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone());
+        crate::rt::spawn(async move {
+            let r = async {
+                for (i, (data, name, mime)) in items.into_iter().enumerate() {
+                    let media = c.upload_media(&data, &name, &mime).await?;
+                    c.send_media(&cid, &pid, media, if i + 1 == n { &caption } else { "" }, None).await?;
+                }
+                anyhow::Ok(())
+            }.await;
+            let _ = tx.send(r).await;
+        });
+        let me = self.clone();
+        glib::spawn_future_local(async move {
+            if let Ok(Err(e)) = rx.recv().await { me.toast.add_toast(adw::Toast::new(&format!("Send failed: {e:#}"))); }
         });
     }
 
