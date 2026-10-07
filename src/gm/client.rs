@@ -606,6 +606,14 @@ impl Client {
         if !r.success { bail!("phone refused to delete the conversation") }
         Ok(())
     }
+    /// React to a message: `Add` a first reaction, `Switch` ours to a different emoji, or
+    /// `Remove` it. Everyone gets one reaction per message, as in the Messages app.
+    pub async fn send_reaction(&self, message_id: &str, emoji: &str, action: send_reaction_request::Action) -> Result<()> {
+        let req = SendReactionRequest { message_id: message_id.into(), reaction_data: Some(reaction_data(emoji)), action: action as i32, sim_payload: None };
+        let r: SendReactionResponse = self.call(ActionType::SendReaction, req, true).await?;
+        if !r.success { bail!("phone refused the reaction") }
+        Ok(())
+    }
     pub async fn is_bugle_default(&self) -> Result<bool> {
         Ok(self.call::<_, IsBugleDefaultResponse>(ActionType::IsBugleDefault, EmptyArr {}, false).await?.success)
     }
@@ -626,6 +634,46 @@ mod stream_tests {
             i += n;
         }
         assert_eq!(frames, vec!["[null,null,null,[0]]", "[null,null,[]]", r#"[null,["id",19]]"#]);
+    }
+}
+
+/// The reactions the phone knows by name, and the emoji each stands for. The phone uses the
+/// type for things like SMS fallback text ("Liked …"); any other emoji goes out as `CUSTOM`.
+const NAMED_REACTIONS: &[(conversations::EmojiType, &str)] = {
+    use conversations::EmojiType as T;
+    &[
+        (T::Like, "👍"), (T::Love, "😍"), (T::Laugh, "😂"), (T::Surprised, "😮"), (T::Sad, "😥"), (T::Angry, "😠"),
+        (T::Dislike, "👎"), (T::Questioning, "🤔"), (T::CryingFace, "😢"), (T::PoutingFace, "😡"), (T::RedHeart, "❤️"),
+    ]
+};
+
+/// Emoji compare equal with or without the U+FE0F presentation selector ("❤" vs "❤️").
+pub fn same_emoji(a: &str, b: &str) -> bool { a.replace('\u{fe0f}', "") == b.replace('\u{fe0f}', "") }
+
+/// The wire form of reacting with `emoji`.
+pub fn reaction_data(emoji: &str) -> conversations::ReactionData {
+    let ty = NAMED_REACTIONS.iter().find(|(_, e)| same_emoji(e, emoji)).map(|(t, _)| *t).unwrap_or(conversations::EmojiType::Custom);
+    conversations::ReactionData { unicode: emoji.into(), r#type: ty as i32, custom_emoji: None }
+}
+
+/// The emoji a received reaction shows as: its Unicode, or the named type's emoji when the
+/// phone sent only the type. Empty for custom (image) reactions we can't draw.
+pub fn reaction_emoji(d: &conversations::ReactionData) -> String {
+    if !d.unicode.is_empty() { return d.unicode.clone(); }
+    NAMED_REACTIONS.iter().find(|(t, _)| *t as i32 == d.r#type).map(|(_, e)| e.to_string()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod reaction_tests {
+    use super::*;
+    use conversations::EmojiType as T;
+    #[test]
+    fn named_and_custom() {
+        assert_eq!(reaction_data("👍").r#type, T::Like as i32);
+        assert_eq!(reaction_data("❤").r#type, T::RedHeart as i32);
+        assert_eq!(reaction_data("🦉").r#type, T::Custom as i32);
+        assert_eq!(reaction_data("🦉").unicode, "🦉");
+        assert_eq!(reaction_emoji(&conversations::ReactionData { unicode: String::new(), r#type: T::Laugh as i32, custom_emoji: None }), "😂");
     }
 }
 
