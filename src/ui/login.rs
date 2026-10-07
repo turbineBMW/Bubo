@@ -13,11 +13,27 @@ const START_URL: &str = "https://messages.google.com/web/authentication";
 
 pub struct LoginPage { pub widget: adw::NavigationPage }
 
+fn network_session() -> webkit6::NetworkSession {
+    let dirs = directories::ProjectDirs::from("dev", "turbinebmw", "bubo").unwrap();
+    webkit6::NetworkSession::new(Some(dirs.data_dir().join("webkit").to_str().unwrap()), Some(dirs.cache_dir().join("webkit").to_str().unwrap()))
+}
+
+/// Forget the WebView's Google sign-in (cookies, storage, cache), then call `done`. Goes through
+/// WebKit rather than deleting the directories, since its network process may still have them open.
+pub fn clear_signin(done: impl FnOnce() + 'static) {
+    let mgr = network_session().website_data_manager().unwrap();
+    // WebKit wants a Send callback; it is invoked on the main thread, which the guard checks.
+    let done = gtk4::glib::thread_guard::ThreadGuard::new(done);
+    mgr.clear(webkit6::WebsiteDataTypes::ALL, gtk4::glib::TimeSpan::from_seconds(0), None::<&gtk4::gio::Cancellable>, move |res| {
+        if let Err(e) = res { tracing::warn!("clearing WebView data: {e}"); }
+        (done.into_inner())();
+    });
+}
+
 impl LoginPage {
     /// `on_cookies` fires once with the harvested cookies.
     pub fn new(on_cookies: impl Fn(std::collections::HashMap<String, String>) + 'static) -> Self {
-        let dirs = directories::ProjectDirs::from("dev", "turbinebmw", "bubo").unwrap();
-        let session = webkit6::NetworkSession::new(Some(dirs.data_dir().join("webkit").to_str().unwrap()), Some(dirs.cache_dir().join("webkit").to_str().unwrap()));
+        let session = network_session();
         let web = webkit6::WebView::builder().network_session(&session).vexpand(true).build();
         if let Some(s) = WebViewExt::settings(&web) { s.set_user_agent(Some(crate::gm::http::USER_AGENT)); }
         let header = adw::HeaderBar::builder().title_widget(&adw::WindowTitle::new("Sign in to Google", "Bubo never sees your password — only the session cookies")).build();

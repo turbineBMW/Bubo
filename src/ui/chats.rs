@@ -220,14 +220,6 @@ impl ChatsView {
 
         let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
             pending_box, pending: RefCell::default(), settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
-        let unpair = gtk4::gio::SimpleAction::new("unpair", None);
-        let c = v.client.clone(); let w = win.clone();
-        unpair.connect_activate(move |_, _| {
-            let c = c.clone();
-            crate::rt::spawn(async move { let _ = c.unpair().await; let _ = std::fs::remove_file(crate::gm::auth::path()); });
-            w.close();
-        });
-        win.application().unwrap().add_action(&unpair);
         v
     }
 
@@ -352,7 +344,11 @@ impl ChatsView {
                 let cb = self.on_session_expired.borrow_mut().take();
                 if let Some(cb) = cb { cb(); }
             }
-            Event::Unpaired => { self.banner.set_title("This device was unpaired from the phone."); self.banner.set_revealed(true); let _ = std::fs::remove_file(crate::gm::auth::path()); }
+            Event::Unpaired => {
+                self.banner.set_title("This device was unpaired from the phone."); self.banner.set_revealed(true);
+                let cb = self.on_session_expired.borrow_mut().take();
+                if let Some(cb) = cb { cb(); }
+            }
             Event::Typing(t) => {
                 let cur = self.st.borrow().current.clone();
                 if cur.as_deref() == Some(&t.conversation_id) {

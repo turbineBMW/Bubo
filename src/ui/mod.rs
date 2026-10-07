@@ -144,14 +144,51 @@ fn repair(win: &adw::ApplicationWindow, stack: &gtk4::Stack, client: &std::sync:
     start_pairing(win, stack, auth);
 }
 
+/// The user unpaired: forget everything — pairing, Google cookies, the WebView's sign-in — and
+/// start from the sign-in page like a fresh install.
+fn reset(win: &adw::ApplicationWindow, stack: &gtk4::Stack, client: &std::sync::Arc<gm::client::Client>) {
+    client.disconnect();
+    if let Err(e) = std::fs::remove_file(gm::auth::path()) { if e.kind() != std::io::ErrorKind::NotFound { tracing::warn!("removing auth: {e:#}"); } }
+    for p in ["chats", "fatal", "connecting"] { drop_page(stack, p); }
+    let spinner = adw::StatusPage::builder().title("Signing out…").build();
+    spinner.set_child(Some(&adw::Spinner::new()));
+    stack.add_named(&spinner, Some("connecting"));
+    stack.set_visible_child_name("connecting");
+    let (win, stack) = (win.clone(), stack.clone());
+    login::clear_signin(move || { drop_page(&stack, "connecting"); start_pairing(&win, &stack, gm::auth::AuthData::new()); });
+}
+
 fn show_chats(win: &adw::ApplicationWindow, stack: &gtk4::Stack, client: std::sync::Arc<gm::client::Client>, events: async_channel::Receiver<gm::events::Event>) {
     let view = Rc::new(chats::ChatsView::new(win, client.clone(), events));
     stack.add_named(&view.widget, Some("chats"));
     stack.set_visible_child_name("chats");
     {
         let (win, stack) = (win.clone(), stack.clone());
+        let client = client.clone();
         view.set_on_session_expired(move || repair(&win, &stack, &client));
     }
+    // Unpair in place: wait for the revoke to reach Google (the app used to quit here, killing
+    // the request and the auth.json cleanup with it), then start over as a fresh install.
+    let unpair = gtk4::gio::SimpleAction::new("unpair", None);
+    {
+        let (win, stack) = (win.clone(), stack.clone());
+        unpair.connect_activate(move |a, _| {
+            a.set_enabled(false);
+            let c = client.clone();
+            let (tx, rx) = async_channel::bounded::<()>(1);
+            crate::rt::spawn(async move {
+                match tokio::time::timeout(std::time::Duration::from_secs(10), c.unpair()).await {
+                    Ok(Err(e)) => tracing::warn!("unpair: {e:#}"),
+                    Err(_) => tracing::warn!("unpair: timed out"),
+                    Ok(Ok(())) => {}
+                }
+                let _ = tx.send(()).await;
+            });
+            let (win, stack, client) = (win.clone(), stack.clone(), client.clone());
+            glib::spawn_future_local(async move { let _ = rx.recv().await; reset(&win, &stack, &client); });
+        });
+    }
+    win.application().unwrap().add_action(&unpair);
     view.start();
 }
 
