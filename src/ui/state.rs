@@ -17,6 +17,15 @@ pub struct Msg {
     /// Microseconds since epoch.
     pub ts: i64,
     pub status: i32,
+    /// One entry per distinct emoji, in the order the phone lists them.
+    pub reactions: Vec<Reaction>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Reaction {
+    pub emoji: String,
+    /// Who reacted with it; ours shows up under one of the conversation's `self_ids`.
+    pub participant_ids: Vec<String>,
 }
 
 impl Msg {
@@ -43,6 +52,10 @@ impl Msg {
             sender_color: sp.map(|p| p.avatar_hex_color.clone()).unwrap_or_default(),
             text: text.join("\n"), media, ts: m.timestamp,
             status: m.message_status.as_ref().map(|s| s.status).unwrap_or(0),
+            reactions: m.reactions.iter().filter_map(|r| {
+                let emoji = crate::gm::client::reaction_emoji(r.data.as_ref()?);
+                (!emoji.is_empty() && !r.participant_i_ds.is_empty()).then(|| Reaction { emoji, participant_ids: r.participant_i_ds.clone() })
+            }).collect(),
         }
     }
 }
@@ -85,6 +98,8 @@ pub struct Conv {
     pub unread_count: u32,
     pub is_group: bool,
     pub default_outgoing_id: String,
+    /// Every participant id that is us in this conversation (for spotting our own reactions).
+    pub self_ids: Vec<String>,
     pub latest_message_id: String,
     pub is_rcs: bool,
     /// Participant ids other than us — the keys used to fetch contact photos from the phone.
@@ -103,7 +118,14 @@ impl Conv {
             last_from_me: lm.map(|m| m.from_me != 0).unwrap_or(false),
             last_sender: lm.map(|m| m.display_name.clone()).unwrap_or_default(),
             ts: c.last_message_timestamp, unread: c.unread, unread_count: 0, is_group: c.is_group_chat,
-            default_outgoing_id: c.default_outgoing_id.clone(), latest_message_id: c.latest_message_id.clone(),
+            default_outgoing_id: c.default_outgoing_id.clone(),
+            self_ids: {
+                let mut ids: Vec<String> = c.participants.iter().filter(|p| p.is_me)
+                    .filter_map(|p| p.id.as_ref().map(|i| i.participant_id.clone())).filter(|s| !s.is_empty()).collect();
+                if !c.default_outgoing_id.is_empty() && !ids.contains(&c.default_outgoing_id) { ids.push(c.default_outgoing_id.clone()); }
+                ids
+            },
+            latest_message_id: c.latest_message_id.clone(),
             is_rcs: c.r#type == 2,
             deleted: c.status == 3,
             participant_ids: {

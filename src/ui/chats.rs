@@ -1,5 +1,5 @@
 //! Conversation list + message thread + composer.
-use super::state::{Conv, Media, Msg, fmt_time};
+use super::state::{Conv, Media, Msg, Reaction, fmt_time};
 use crate::gm::client::Client;
 use crate::gm::events::Event;
 use crate::gm::proto::client::list_conversations_request::Folder;
@@ -24,6 +24,10 @@ struct State {
 }
 
 const PAGE: i64 = 50;
+
+/// The row of one-tap reactions in a message's menu, as in the Messages app; the "+" after it
+/// opens the full emoji chooser.
+const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "😡"];
 
 /// Where the thread scroller should settle after its contents change.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -104,6 +108,11 @@ struct ContactEntry {
 /// Cache key for an address-book photo. Contact ids live in a different namespace from
 /// participant ids, so prefix them to keep the two apart in the avatar cache.
 fn contact_key(contact_id: &str) -> String { format!("contact:{contact_id}") }
+
+/// The emoji we reacted to a message with, if any.
+fn my_reaction<'a>(reactions: &'a [Reaction], self_ids: &[String]) -> Option<&'a str> {
+    reactions.iter().find(|r| r.participant_ids.iter().any(|p| self_ids.contains(p))).map(|r| r.emoji.as_str())
+}
 
 /// Keep only what a dialler would: a leading `+` and digits. `None` if the text doesn't look
 /// like a phone number at all (letters, or fewer than three digits).
@@ -209,6 +218,13 @@ impl ChatsView {
             .bubo-pending-remove { margin: 4px; min-width: 22px; min-height: 22px; padding: 0; }
             .bubo-thread row { background: transparent; border: none; box-shadow: none; padding: 0; margin: 2px 0; }
             .bubo-meta { font-size: 0.8em; opacity: 0.7; }
+            /* reaction chips straddle the bubble's bottom edge, ringed in the window colour */
+            .bubo-reactions { margin: -10px 10px 0 10px; }
+            .bubo-reaction { min-height: 0; min-width: 0; padding: 1px 7px; border-radius: 999px; font-size: 0.85em;
+                             background: color-mix(in srgb, currentColor 10%, var(--window-bg-color)); border: 2px solid var(--window-bg-color); }
+            .bubo-reaction-mine { background: color-mix(in srgb, var(--accent-bg-color) 35%, var(--window-bg-color)); }
+            .bubo-react-pick { font-size: 1.4em; min-width: 40px; min-height: 40px; padding: 0; }
+            .bubo-react-pick.bubo-reaction-mine { background: alpha(var(--accent-bg-color), 0.35); }
             .bubo-snippet { opacity: 0.7; }
             .bubo-convs row { padding: 10px 10px; }
             .bubo-badge { background: var(--accent-bg-color); color: var(--accent-fg-color); border-radius: 999px;
@@ -548,19 +564,27 @@ impl ChatsView {
         let viewing = self.st.borrow().current.as_deref() == Some(&conv_id);
         // Decide before touching the list: follow the conversation if the user is at its end or
         // just sent something; otherwise hold their place while they read older messages.
+        // Updates to a message we already have (status, reactions) only follow if already there.
+        let is_new = !self.knows(&m);
         let adj = self.thread_scroll.vadjustment();
-        let target = if m.from_me || self.at_bottom() || self.scroll_target.get() == ScrollTarget::Bottom { ScrollTarget::Bottom } else { ScrollTarget::FromBottom(adj.upper() - adj.value()) };
-        let is_new = {
+        let target = if (m.from_me && is_new) || self.at_bottom() || self.scroll_target.get() == ScrollTarget::Bottom { ScrollTarget::Bottom } else { ScrollTarget::FromBottom(adj.upper() - adj.value()) };
+        {
             let mut st = self.st.borrow_mut();
             let list = st.messages.entry(conv_id.clone()).or_default();
-            if let Some(x) = list.iter_mut().find(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) { *x = m.clone(); false }
-            else { list.push(m.clone()); list.sort_by_key(|m| m.ts); true }
-        };
+            if let Some(x) = list.iter_mut().find(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) { *x = m.clone(); }
+            else { list.push(m.clone()); list.sort_by_key(|m| m.ts); }
+        }
         if is_new && !is_old && !m.from_me && !viewing {
             if let Some(c) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == conv_id) { c.unread = true; c.unread_count += 1; }
             self.rebuild_list();
         }
         if viewing { self.render_thread(target); }
+    }
+
+    /// Whether `m` (by id, or by tmp id for our own echo) is already in its conversation.
+    fn knows(&self, m: &Msg) -> bool {
+        self.st.borrow().messages.get(&m.conversation_id)
+            .is_some_and(|l| l.iter().any(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)))
     }
 
     fn render_thread(self: &Rc<Self>, target: ScrollTarget) {
@@ -570,12 +594,14 @@ impl ChatsView {
         let Some(cur) = &st.current else { return };
         let Some(msgs) = st.messages.get(cur) else { return };
         self.content_stack.set_visible_child_name("thread");
-        let group = st.convs.iter().find(|c| &c.id == cur).map(|c| c.is_group).unwrap_or(false);
+        let conv = st.convs.iter().find(|c| &c.id == cur);
+        let group = conv.map(|c| c.is_group).unwrap_or(false);
+        let self_ids = conv.map(|c| c.self_ids.clone()).unwrap_or_default();
         if st.cursors.get(cur).map(|c| c.is_some()).unwrap_or(false) {
             let spinner = adw::Spinner::builder().width_request(24).height_request(24).margin_top(8).margin_bottom(8).halign(gtk4::Align::Center).build();
             self.thread.append(&gtk4::ListBoxRow::builder().child(&spinner).activatable(false).selectable(false).build());
         }
-        for m in msgs { self.thread.append(&self.bubble(m, group)); }
+        for m in msgs { self.thread.append(&self.bubble(m, group, &self_ids)); }
         drop(st);
         self.apply_scroll_target();
     }
@@ -955,6 +981,11 @@ impl ChatsView {
     /// conversation is already open in a focused window.
     fn maybe_notify(self: &Rc<Self>, m: &Msg, is_old: bool) {
         if is_old || m.from_me { return; }
+        // Status and reaction changes re-send the whole message; only its first sighting is news.
+        // One we never loaded that already carries reactions is an old message being reacted to.
+        if self.knows(m) { return; }
+        let age_us = glib::real_time() - m.ts;
+        if !m.reactions.is_empty() && age_us > 60_000_000 { return; }
         let st = self.st.borrow();
         let focused_here = self.win.is_active() && st.current.as_deref() == Some(&m.conversation_id);
         if focused_here { return; }
@@ -1271,7 +1302,7 @@ fn conv_row(c: &Conv, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> 
 }
 
 impl ChatsView {
-    fn bubble(self: &Rc<Self>, m: &Msg, group: bool) -> gtk4::ListBoxRow {
+    fn bubble(self: &Rc<Self>, m: &Msg, group: bool, self_ids: &[String]) -> gtk4::ListBoxRow {
     let halign = if m.from_me { gtk4::Align::End } else { gtk4::Align::Start };
     let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(4).halign(halign).build();
     let bubble = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).css_classes(["bubo-bubble", if m.from_me { "bubo-me" } else { "bubo-them" }]).halign(halign).build();
@@ -1297,11 +1328,137 @@ impl ChatsView {
         bubble.append(&gtk4::Label::builder().label(&m.text).wrap(true).wrap_mode(gtk4::pango::WrapMode::WordChar).xalign(0.0).selectable(true).max_width_chars(60).build());
     }
     if bubble.first_child().is_some() { col.append(&bubble); }
+    let mine = my_reaction(&m.reactions, self_ids);
+    if !m.reactions.is_empty() {
+        let chips = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(2).halign(halign).css_classes(["bubo-reactions"]).build();
+        for r in &m.reactions {
+            let label = if r.participant_ids.len() > 1 { format!("{} {}", r.emoji, r.participant_ids.len()) } else { r.emoji.clone() };
+            let is_mine = mine.is_some_and(|e| e == r.emoji);
+            let chip = gtk4::Button::builder().label(&label).css_classes(["bubo-reaction"]).focus_on_click(false)
+                .tooltip_text(if is_mine { "Remove your reaction".to_string() } else { format!("React with {}", r.emoji) }).build();
+            if is_mine { chip.add_css_class("bubo-reaction-mine"); }
+            let (me, cid, mid, e) = (self.clone(), m.conversation_id.clone(), m.id.clone(), r.emoji.clone());
+            chip.connect_clicked(move |_| me.react(&cid, &mid, &e));
+            chips.append(&chip);
+        }
+        col.append(&chips);
+    }
+    // Right-click (or long-press on touch) opens the reaction menu. It runs in the capture phase
+    // so it wins over the selectable label's own menu; that menu's "Copy" lives in ours instead.
+    if !m.id.is_empty() {
+        let click = gtk4::GestureClick::builder().button(gtk4::gdk::BUTTON_SECONDARY).propagation_phase(gtk4::PropagationPhase::Capture).build();
+        let (me, msg, w) = (self.clone(), m.clone(), col.downgrade());
+        click.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(w) = w.upgrade() { me.reaction_menu(&w, x, y, &msg); }
+        });
+        col.add_controller(click);
+        let press = gtk4::GestureLongPress::builder().touch_only(true).propagation_phase(gtk4::PropagationPhase::Capture).build();
+        let (me, msg, w) = (self.clone(), m.clone(), col.downgrade());
+        press.connect_pressed(move |g, x, y| {
+            g.set_state(gtk4::EventSequenceState::Claimed);
+            if let Some(w) = w.upgrade() { me.reaction_menu(&w, x, y, &msg); }
+        });
+        col.add_controller(press);
+    }
     let mut meta = fmt_time(m.ts);
     if m.from_me { meta.push_str(match m.status { 1 | 2 | 3 | 4 | 5 | 6 => " · sent", 11 => " · delivered", 12 => " · read", s if s >= 100 => " · failed", _ => "" }); }
     let meta = gtk4::Label::builder().label(&meta).css_classes(["bubo-meta"]).halign(halign).build();
     col.append(&meta);
     gtk4::ListBoxRow::builder().child(&col).activatable(false).selectable(false).build()
+    }
+
+    /// The menu a right-click on a message opens: the quick reactions (ours highlighted), a "+"
+    /// for any other emoji, and "Copy text" when the message has some.
+    fn reaction_menu(self: &Rc<Self>, anchor: &gtk4::Box, x: f64, y: f64, m: &Msg) {
+        let self_ids = { let st = self.st.borrow(); st.convs.iter().find(|c| c.id == m.conversation_id).map(|c| c.self_ids.clone()).unwrap_or_default() };
+        let mine = my_reaction(&m.reactions, &self_ids).map(str::to_owned);
+        let at = gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1);
+        let pop = gtk4::Popover::builder().has_arrow(false).pointing_to(&at).build();
+        pop.set_parent(anchor);
+        // Popovers made per click are dropped again once closed, so rows don't collect them.
+        pop.connect_closed(|p| { let p = p.clone(); glib::idle_add_local_once(move || p.unparent()); });
+        let body = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        for &e in QUICK_REACTIONS {
+            let b = gtk4::Button::builder().label(e).css_classes(["flat", "circular", "bubo-react-pick"]).build();
+            if mine.as_deref().is_some_and(|x| crate::gm::client::same_emoji(x, e)) { b.add_css_class("bubo-reaction-mine"); }
+            let (me, cid, mid, p) = (self.clone(), m.conversation_id.clone(), m.id.clone(), pop.downgrade());
+            b.connect_clicked(move |_| { if let Some(p) = p.upgrade() { p.popdown(); } me.react(&cid, &mid, e); });
+            row.append(&b);
+        }
+        let more = gtk4::Button::builder().icon_name("list-add-symbolic").css_classes(["flat", "circular", "bubo-react-pick"]).tooltip_text("More reactions").build();
+        let (me, cid, mid, p, a) = (self.clone(), m.conversation_id.clone(), m.id.clone(), pop.downgrade(), anchor.downgrade());
+        more.connect_clicked(move |_| {
+            if let Some(p) = p.upgrade() { p.popdown(); }
+            let Some(a) = a.upgrade() else { return };
+            let chooser = gtk4::EmojiChooser::builder().pointing_to(&at).build();
+            chooser.set_parent(&a);
+            let (me, cid, mid) = (me.clone(), cid.clone(), mid.clone());
+            chooser.connect_emoji_picked(move |_, e| me.react(&cid, &mid, e));
+            chooser.connect_closed(|c| { let c = c.clone(); glib::idle_add_local_once(move || c.unparent()); });
+            chooser.popup();
+        });
+        row.append(&more);
+        body.append(&row);
+        if !m.text.trim().is_empty() {
+            let copy = gtk4::Button::builder().label("Copy text").css_classes(["flat"]).build();
+            let (text, p) = (m.text.clone(), pop.downgrade());
+            copy.connect_clicked(move |b| { b.clipboard().set_text(&text); if let Some(p) = p.upgrade() { p.popdown(); } });
+            body.append(&copy);
+        }
+        pop.set_child(Some(&body));
+        pop.popup();
+    }
+
+    /// React to a message the way the Messages app does: one reaction per person, so picking our
+    /// current emoji again takes it back and picking another switches to it. The thread updates
+    /// at once; the phone's echo of the message then confirms it, or a failure puts it back.
+    fn react(self: &Rc<Self>, conv_id: &str, msg_id: &str, emoji: &str) {
+        use crate::gm::proto::client::send_reaction_request::Action;
+        let (self_ids, me_id, before) = {
+            let st = self.st.borrow();
+            let Some(conv) = st.convs.iter().find(|c| c.id == conv_id) else { return };
+            let Some(m) = st.messages.get(conv_id).and_then(|l| l.iter().find(|m| m.id == msg_id)) else { return };
+            let me_id = conv.self_ids.first().cloned().unwrap_or_else(|| "me".into());
+            (conv.self_ids.clone(), me_id, m.reactions.clone())
+        };
+        let action = match my_reaction(&before, &self_ids) {
+            Some(e) if crate::gm::client::same_emoji(e, emoji) => Action::Remove,
+            Some(_) => Action::Switch,
+            None => Action::Add,
+        };
+        let mut after: Vec<Reaction> = before.iter().cloned()
+            .map(|mut r| { r.participant_ids.retain(|p| !self_ids.contains(p)); r })
+            .filter(|r| !r.participant_ids.is_empty()).collect();
+        if action != Action::Remove {
+            match after.iter_mut().find(|r| crate::gm::client::same_emoji(&r.emoji, emoji)) {
+                Some(r) => r.participant_ids.push(me_id),
+                None => after.push(Reaction { emoji: emoji.into(), participant_ids: vec![me_id] }),
+            }
+        }
+        self.set_reactions(conv_id, msg_id, after);
+        let (tx, rx) = async_channel::bounded(1);
+        let (c, mid, e) = (self.client.clone(), msg_id.to_owned(), emoji.to_owned());
+        crate::rt::spawn(async move { let _ = tx.send(c.send_reaction(&mid, &e, action).await).await; });
+        let (me, cid, mid) = (self.clone(), conv_id.to_owned(), msg_id.to_owned());
+        glib::spawn_future_local(async move {
+            if let Ok(Err(e)) = rx.recv().await {
+                me.toast.add_toast(adw::Toast::new(&format!("Reaction failed: {e:#}")));
+                me.set_reactions(&cid, &mid, before);
+            }
+        });
+    }
+
+    fn set_reactions(self: &Rc<Self>, conv_id: &str, msg_id: &str, reactions: Vec<Reaction>) {
+        {
+            let mut st = self.st.borrow_mut();
+            let Some(m) = st.messages.get_mut(conv_id).and_then(|l| l.iter_mut().find(|m| m.id == msg_id)) else { return };
+            m.reactions = reactions;
+        }
+        if self.st.borrow().current.as_deref() != Some(conv_id) { return; }
+        let adj = self.thread_scroll.vadjustment();
+        self.render_thread(if self.at_bottom() { ScrollTarget::Bottom } else { ScrollTarget::FromBottom(adj.upper() - adj.value()) });
     }
 
     /// Fetch the full-resolution image the first time `pic` is within one viewport-height of the
