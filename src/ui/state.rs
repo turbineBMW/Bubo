@@ -12,6 +12,8 @@ pub struct Msg {
     pub sender_full: String,
     pub sender_id: String,
     pub sender_color: String,
+    /// Whether the sender is in the phone's address book (initials) or a bare number (blank).
+    pub sender_is_contact: bool,
     pub text: String,
     pub media: Vec<Media>,
     /// Microseconds since epoch.
@@ -50,6 +52,7 @@ impl Msg {
             sender_full: sp.map(|p| if !p.full_name.is_empty() { p.full_name.clone() } else if !p.first_name.is_empty() { p.first_name.clone() } else { p.formatted_number.clone() }).unwrap_or_default(),
             sender_id: sp.and_then(|p| p.id.as_ref()).map(|i| i.participant_id.clone()).unwrap_or_default(),
             sender_color: sp.map(|p| p.avatar_hex_color.clone()).unwrap_or_default(),
+            sender_is_contact: sp.is_some_and(|p| !p.contact_id.is_empty()),
             text: text.join("\n"), media, ts: m.timestamp,
             status: m.message_status.as_ref().map(|s| s.status).unwrap_or(0),
             reactions: m.reactions.iter().filter_map(|r| {
@@ -102,11 +105,21 @@ pub struct Conv {
     pub self_ids: Vec<String>,
     pub latest_message_id: String,
     pub is_rcs: bool,
-    /// Participant ids other than us — the keys used to fetch contact photos from the phone.
-    pub participant_ids: Vec<String>,
+    /// The people on the other end, in the phone's order. Their ids are the keys used to fetch
+    /// contact photos from the phone.
+    pub members: Vec<Member>,
     /// The phone reports deleted conversations as updates with `status = DELETED` rather than
     /// dropping them, so the list has to filter them out itself.
     pub deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+    /// In the phone's address book. Without a photo, contacts show their initials and bare
+    /// numbers a blank silhouette.
+    pub is_contact: bool,
 }
 
 impl Conv {
@@ -128,12 +141,19 @@ impl Conv {
             latest_message_id: c.latest_message_id.clone(),
             is_rcs: c.r#type == 2,
             deleted: c.status == 3,
-            participant_ids: {
-                // `otherParticipants` is only filled for groups; 1:1 chats list everyone in `participants`.
-                let mut ids: Vec<String> = c.participants.iter().filter(|p| !p.is_me)
-                    .filter_map(|p| p.id.as_ref().map(|i| i.participant_id.clone())).filter(|s| !s.is_empty()).collect();
-                for o in &c.other_participants { if !ids.contains(o) { ids.push(o.clone()); } }
-                ids
+            members: {
+                // `otherParticipants` is only filled for groups; 1:1 chats list everyone in `participants`,
+                // including hidden entries such as our own address-book card (not flagged `isMe`), so
+                // only visible participants count.
+                let mut ms: Vec<Member> = c.participants.iter().filter(|p| !p.is_me && p.is_visible).filter_map(|p| {
+                    let id = p.id.as_ref().map(|i| i.participant_id.clone()).filter(|s| !s.is_empty())?;
+                    let name = if !p.full_name.is_empty() { p.full_name.clone() } else if !p.first_name.is_empty() { p.first_name.clone() } else { p.formatted_number.clone() };
+                    Some(Member { id, name, is_contact: !p.contact_id.is_empty() })
+                }).collect();
+                for o in &c.other_participants {
+                    if !ms.iter().any(|m| &m.id == o) { ms.push(Member { id: o.clone(), name: String::new(), is_contact: false }); }
+                }
+                ms
             },
         }
     }
