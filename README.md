@@ -24,6 +24,10 @@ out of a UKEY2 handshake between Bubo and the phone. (Google retired QR pairing 
 
 ## Running
 
+Needs GTK 4, libadwaita, WebKitGTK 6.0 and libspelling (`libspelling`, which pulls in
+GtkSourceView 5 and Enchant). Spell checking in the composer also needs a Hunspell
+dictionary for your language (e.g. `hunspell-en_us`); without one it checks nothing.
+
 ```sh
 cargo run                    # GUI; first launch opens Google sign-in, then shows the emoji
 cargo run -- login           # headless: paste a Cookie header from a signed-in messages.google.com tab
@@ -91,6 +95,7 @@ Google-account (emoji) pairing and message sync verified live end-to-end 2026-08
 - [x] Conversation list, message history, send text, read receipts, typing
 - [x] Desktop notifications (click to open the conversation)
 - [x] Media: view inbound images inline, download files, send images/files (AES-GCM chunked)
+- [x] Spell checking in the composer (Preferences → Composing, or the composer's right-click menu)
 - [ ] Reactions, replies, contacts / new conversation UI
 
 ## Licence

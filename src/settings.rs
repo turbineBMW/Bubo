@@ -22,11 +22,13 @@ pub enum Sound {
 pub struct Settings {
     pub notification_sound: Sound,
     pub follow_omarchy_theme: bool,
+    /// Underline misspelled words in the composer.
+    pub spell_check: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notification_sound: Sound::default(), follow_omarchy_theme: true }
+        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true }
     }
 }
 
@@ -55,6 +57,7 @@ mod tests {
     fn existing_preferences_follow_omarchy_and_preserve_sound() {
         let settings: Settings = serde_json::from_str(r#"{"notification_sound":{"kind":"none"}}"#).unwrap();
         assert!(settings.follow_omarchy_theme);
+        assert!(settings.spell_check);
         assert_eq!(settings.notification_sound, Sound::None);
         let opted_out = Settings { follow_omarchy_theme: false, ..settings };
         let saved = serde_json::to_string(&opted_out).unwrap();
