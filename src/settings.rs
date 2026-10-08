@@ -24,17 +24,32 @@ pub struct Settings {
     pub follow_omarchy_theme: bool,
     /// Underline misspelled words in the composer.
     pub spell_check: bool,
+    /// Closing the window hides it, so messages keep arriving as notifications.
+    pub run_in_background: bool,
+    /// What "Start at login" was last set to; the portal, systemd or the autostart entry
+    /// holds the real thing (see `autostart`).
+    pub start_at_login: bool,
+    /// The one-time notice that closing left Bubo running has been shown.
+    pub background_notice_shown: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true }
+        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true, run_in_background: false, start_at_login: false, background_notice_shown: false }
     }
 }
 
 pub fn path() -> PathBuf {
     directories::ProjectDirs::from("dev", "turbinebmw", "bubo").map(|d| d.config_dir().join("settings.json")).expect("no config dir")
 }
+
+thread_local! {
+    static SHARED: std::rc::Rc<std::cell::RefCell<Settings>> = std::rc::Rc::new(std::cell::RefCell::new(Settings::load()));
+}
+
+/// The UI's one copy, so a save from one place (the close handler, Preferences) never writes back
+/// another's stale view. GTK thread only.
+pub fn shared() -> std::rc::Rc<std::cell::RefCell<Settings>> { SHARED.with(|s| s.clone()) }
 
 impl Settings {
     pub fn load() -> Self {

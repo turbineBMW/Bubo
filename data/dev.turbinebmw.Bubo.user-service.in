@@ -1,0 +1,18 @@
+[Unit]
+Description=Bubo, receiving Google Messages in the background
+Documentation=https://github.com/turbineBMW/Bubo
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.turbinebmw.Bubo
+# --hidden connects to the phone, so notifications arrive, without showing the window;
+# opening Bubo from the launcher then presents it.
+ExecStart=@bindir@/bubo --hidden
+# A crash brings it back. Quitting from the menu exits cleanly and stays quit.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

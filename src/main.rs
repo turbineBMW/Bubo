@@ -1,4 +1,5 @@
 mod accent;
+mod autostart;
 mod gif;
 mod gm;
 mod notify;
@@ -23,14 +24,35 @@ fn main() -> anyhow::Result<()> {
         Some("unpair") => return rt::block_on(cli_unpair()),
         _ => {}
     }
-    let app = adw::Application::builder().application_id(APP_ID).flags(gtk4::gio::ApplicationFlags::NON_UNIQUE).build();
-    app.connect_startup(|_| {
+    // Unique: a second launch (the launcher, while Bubo runs hidden) raises the running window
+    // instead of opening a second session with the phone.
+    let app = adw::Application::builder().application_id(APP_ID).build();
+    // `--hidden` is how Bubo starts at login (see `autostart`): connect, but show no window.
+    let start_hidden = std::rc::Rc::new(std::cell::Cell::new(args.iter().skip(1).any(|a| a == "--hidden")));
+    let hidden = start_hidden.get();
+    app.connect_handle_local_options(move |app, _| {
+        // Already running (started by both a login unit and an autostart entry, say): nothing to
+        // show, so don't hand the running one an activation that would raise its window.
+        if hidden && app.register(gtk4::gio::Cancellable::NONE).is_ok() && app.is_remote() { std::ops::ControlFlow::Break(gtk4::glib::ExitCode::SUCCESS) }
+        else { std::ops::ControlFlow::Continue(()) }
+    });
+    app.connect_startup(|app| {
         if let Some(display) = gtk4::gdk::Display::default() {
             accent::install_fallback(&display);
             omarchy::install(&display);
         }
+        // With "Run in background" on, closing the window no longer quits.
+        let quit = gtk4::gio::SimpleAction::new("quit", None);
+        let a = app.clone();
+        quit.connect_activate(move |_, _| a.quit());
+        app.add_action(&quit);
+        app.set_accels_for_action("app.quit", &["<Control>q"]);
     });
-    app.connect_activate(|app| { gtk4::Window::set_default_icon_name(APP_ID); ui::build(app); });
+    app.connect_activate(move |app| {
+        if let Some(win) = app.active_window() { win.present(); return; }
+        gtk4::Window::set_default_icon_name(APP_ID);
+        ui::build(app, start_hidden.replace(false));
+    });
     app.run_with_args::<&str>(&[]);
     Ok(())
 }
