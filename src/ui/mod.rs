@@ -9,18 +9,45 @@ use adw::prelude::*;
 use gtk4::glib;
 use std::rc::Rc;
 
-pub fn build(app: &adw::Application) {
+/// `hidden`: started at login. Stay out of sight unless there is pairing to do, which needs the user.
+pub fn build(app: &adw::Application, hidden: bool) {
     let win = adw::ApplicationWindow::builder().application(app).title("Bubo").default_width(1000).default_height(700).build();
     let stack = gtk4::Stack::builder().transition_type(gtk4::StackTransitionType::Crossfade).build();
     win.set_content(Some(&stack));
-    win.present();
+    {
+        let stack = stack.clone();
+        win.connect_close_request(move |win| {
+            // Before pairing there is nothing to receive, so closing quits as usual.
+            if !crate::settings::shared().borrow().run_in_background || stack.child_by_name("chats").is_none() { return glib::Propagation::Proceed; }
+            win.set_visible(false);
+            notify_background(win);
+            glib::Propagation::Stop
+        });
+    }
+    let auth = gm::auth::AuthData::load().ok().flatten();
+    if !(hidden && auth.as_ref().is_some_and(|a| a.is_paired())) { win.present(); }
 
-    match gm::auth::AuthData::load().ok().flatten() {
+    match auth {
         Some(auth) if auth.is_paired() => start_paired(&win, &stack, auth),
         // Cookies but no pairing: the phone expired the last session — straight to the emoji.
         Some(auth) if auth.has_cookies() => start_pairing(&win, &stack, auth),
         _ => start_pairing(&win, &stack, gm::auth::AuthData::new()),
     }
+}
+
+/// Once per install, not once per close: the notice explains why Bubo is still around the first
+/// time it happens, and is noise after that.
+fn notify_background(win: &adw::ApplicationWindow) {
+    let settings = crate::settings::shared();
+    let mut s = settings.borrow_mut();
+    if s.background_notice_shown { return; }
+    s.background_notice_shown = true;
+    s.save();
+    let Some(app) = win.application() else { return };
+    let n = gtk4::gio::Notification::new("Bubo is running in the background");
+    n.set_body(Some("New messages will still notify you. Quit from the menu to stop."));
+    n.set_icon(&gtk4::gio::ThemedIcon::new(crate::APP_ID));
+    app.send_notification(Some("running-background"), &n);
 }
 
 /// Drop a page from the stack if it is there (pages are re-created on every (re-)pair).
@@ -112,7 +139,22 @@ fn start_paired(win: &adw::ApplicationWindow, stack: &gtk4::Stack, auth: gm::aut
     let (client, events) = match gm::client::Client::new(auth) { Ok(x) => x, Err(e) => { fatal(stack, &format!("{e:#}")); return; } };
     let c = client.clone();
     let (tx, rx) = async_channel::bounded::<anyhow::Result<()>>(1);
-    crate::rt::spawn(async move { let _ = tx.send(c.connect().await).await; });
+    crate::rt::spawn(async move {
+        // Started at login the network is often not up yet: wait for it rather than calling the
+        // pairing dead. Only a failure to reach Google retries; an answer from it does not.
+        let mut delay = 2;
+        let result = loop {
+            match c.connect().await {
+                Err(e) if e.chain().any(|c| c.is::<reqwest::Error>()) => {
+                    tracing::info!("could not reach Google ({e:#}); retrying in {delay}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    delay = (delay * 2).min(60);
+                }
+                result => break result,
+            }
+        };
+        let _ = tx.send(result).await;
+    });
     let spinner = adw::StatusPage::builder().title("Connecting to your phone…").build();
     spinner.set_child(Some(&adw::Spinner::new()));
     stack.add_named(&spinner, Some("connecting"));
@@ -122,6 +164,8 @@ fn start_paired(win: &adw::ApplicationWindow, stack: &gtk4::Stack, auth: gm::aut
         match rx.recv().await {
             Ok(Ok(())) => { drop_page(&stack, "connecting"); show_chats(&win, &stack, client, events); }
             Ok(Err(e)) => {
+                // Started hidden, this would otherwise sit unseen while nothing arrives.
+                win.present();
                 let p = fatal(&stack, &format!("Could not connect: {e:#}"));
                 let b = gtk4::Button::builder().label("Pair again").css_classes(["pill", "suggested-action"]).halign(gtk4::Align::Center).build();
                 let (win, stack, client) = (win.clone(), stack.clone(), client.clone());
@@ -137,6 +181,8 @@ fn start_paired(win: &adw::ApplicationWindow, stack: &gtk4::Stack, auth: gm::aut
 /// rest, and run the emoji pairing again on a fresh client.
 fn repair(win: &adw::ApplicationWindow, stack: &gtk4::Stack, client: &std::sync::Arc<gm::client::Client>) {
     client.disconnect();
+    // The phone asks to confirm an emoji only Bubo shows, so come out of the background for it.
+    win.present();
     let auth = client.auth.lock().unwrap().for_repair();
     // Persist the stripped state so a relaunch mid-way also lands on the emoji, not the old session.
     if let Err(e) = auth.save() { tracing::warn!("saving auth for re-pair: {e:#}"); }

@@ -154,6 +154,7 @@ impl ChatsView {
         let menu = gtk4::gio::Menu::new();
         menu.append(Some("Preferences"), Some("app.preferences"));
         menu.append(Some("Unpair phone"), Some("app.unpair"));
+        menu.append(Some("Quit"), Some("app.quit"));
         side_header.pack_end(&gtk4::MenuButton::builder().icon_name("open-menu-symbolic").menu_model(&menu).build());
         let new_chat = gtk4::Button::builder().icon_name("list-add-symbolic").tooltip_text("New conversation").build();
         side_header.pack_start(&new_chat);
@@ -182,7 +183,7 @@ impl ChatsView {
         sourceview5::prelude::BufferExt::set_style_scheme(&buffer, None);
         let entry = sourceview5::View::builder().buffer(&buffer).wrap_mode(gtk4::WrapMode::WordChar).hexpand(true).accepts_tab(false)
             .top_margin(7).bottom_margin(7).left_margin(10).right_margin(10).css_classes(["bubo-entry"]).build();
-        let settings = Rc::new(RefCell::new(crate::settings::Settings::load()));
+        let settings = crate::settings::shared();
         // Enchant picks the dictionary from the locale; with none installed nothing is underlined.
         let spelling = libspelling::TextBufferAdapter::new(&buffer, &libspelling::Checker::default());
         entry.set_extra_menu(Some(&spelling.menu_model()));
@@ -1290,8 +1291,47 @@ impl ChatsView {
         });
         group.add(&sound_row); group.add(&file_row); group.add(&test);
         page.add(&group);
+        page.add(&self.background_group(&dialog));
         dialog.add(&page);
         dialog.present(Some(&self.win));
+    }
+
+    fn background_group(self: &Rc<Self>, dialog: &adw::PreferencesDialog) -> adw::PreferencesGroup {
+        let group = adw::PreferencesGroup::builder().title("Background").build();
+        let background = adw::SwitchRow::builder().title("Run in background").subtitle("Keep receiving messages after the window is closed")
+            .active(self.settings.borrow().run_in_background).build();
+        let me = self.clone();
+        background.connect_active_notify(move |row| { let mut s = me.settings.borrow_mut(); s.run_in_background = row.is_active(); s.save(); });
+        group.add(&background);
+        // Not saved on the click: the portal (or systemd, or the autostart entry) decides, and the
+        // setting records the outcome, so the row follows the answer.
+        let login = adw::SwitchRow::builder().title("Start at login").subtitle("Start hidden when you log in, so messages notify you without opening Bubo")
+            .active(self.settings.borrow().start_at_login).build();
+        let settling = Rc::new(Cell::new(false));
+        let (me, dialog) = (self.clone(), dialog.downgrade());
+        login.connect_active_notify(move |row| {
+            if settling.get() || row.is_active() == me.settings.borrow().start_at_login { return; }
+            // A second request before the first answer would leave the row showing the loser.
+            row.set_sensitive(false);
+            let (me, row, settling, dialog, is_wanted) = (me.clone(), row.clone(), settling.clone(), dialog.clone(), row.is_active());
+            glib::spawn_future_local(async move {
+                let is_enabled = match crate::autostart::set(is_wanted).await {
+                    Ok((is_enabled, method)) => { tracing::info!("start at login set to {is_enabled} ({method:?})"); is_enabled }
+                    Err(e) => {
+                        tracing::warn!("could not set start at login to {is_wanted}: {e}");
+                        if let Some(d) = dialog.upgrade() { d.add_toast(adw::Toast::new("Could not change whether Bubo starts at login")); }
+                        me.settings.borrow().start_at_login
+                    }
+                };
+                { let mut s = me.settings.borrow_mut(); s.start_at_login = is_enabled; s.save(); }
+                settling.set(true);
+                row.set_active(is_enabled);
+                settling.set(false);
+                row.set_sensitive(true);
+            });
+        });
+        group.add(&login);
+        group
     }
 }
 
