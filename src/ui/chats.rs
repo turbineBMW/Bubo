@@ -53,6 +53,8 @@ pub struct ChatsView {
     thread_scroll: gtk4::ScrolledWindow,
     /// Where the thread should sit once GTK has laid out the rows just added to it.
     scroll_target: Cell<ScrollTarget>,
+    /// A frame callback is queued to apply `scroll_target`.
+    scroll_queued: Cell<bool>,
     /// Full-resolution media bytes keyed by attachment id, so re-rendering a thread never refetches.
     media_cache: Rc<RefCell<HashMap<String, Rc<Vec<u8>>>>>,
     /// Contact photos keyed by participant id. `None` records a participant the phone has no
@@ -163,9 +165,14 @@ impl ChatsView {
         // ── thread ──
         let thread = gtk4::ListBox::builder().selection_mode(gtk4::SelectionMode::None).css_classes(["boxed-list-separate"]).margin_start(12).margin_end(12).margin_top(8).margin_bottom(8).valign(gtk4::Align::End).build();
         thread.add_css_class("bubo-thread");
-        let thread_scroll = gtk4::ScrolledWindow::builder().child(&thread).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
+        // The thread manages its own scroll position (see `ScrollTarget`). Left on, the viewport
+        // and the list both scroll to the focused row, so tearing down rows that hold focus (a
+        // message just reacted to, or one with selected text) flung the view to the top.
+        let viewport = gtk4::Viewport::builder().child(&thread).scroll_to_focus(false).build();
+        let thread_scroll = gtk4::ScrolledWindow::builder().child(&viewport).hscrollbar_policy(gtk4::PolicyType::Never).vexpand(true).build();
+        thread.set_adjustment(None::<&gtk4::Adjustment>);
         let thread_title = adw::WindowTitle::new("", "");
-        // Multi-line composer: Enter inserts a newline, Ctrl+Enter sends. The text view grows with
+        // Multi-line composer: Enter sends, Shift+Enter inserts a newline. The text view grows with
         // its content up to a cap, then scrolls; the buttons sit at the bottom edge either way.
         let entry = gtk4::TextView::builder().wrap_mode(gtk4::WrapMode::WordChar).hexpand(true).accepts_tab(false)
             .top_margin(7).bottom_margin(7).left_margin(10).right_margin(10).css_classes(["bubo-entry"]).build();
@@ -178,7 +185,7 @@ impl ChatsView {
         let pl = placeholder.clone();
         entry.buffer().connect_changed(move |b| pl.set_visible(b.char_count() == 0));
         let emoji_btn = gtk4::Button::builder().icon_name("emoji-people-symbolic").css_classes(["circular"]).tooltip_text("Insert emoji").valign(gtk4::Align::End).build();
-        let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).valign(gtk4::Align::End).tooltip_text("Send (Ctrl+Enter)").build();
+        let send = gtk4::Button::builder().icon_name("mail-send-symbolic").css_classes(["suggested-action", "circular"]).valign(gtk4::Align::End).tooltip_text("Send (Enter)").build();
         let attach = gtk4::Button::builder().icon_name("mail-attachment-symbolic").css_classes(["circular"]).tooltip_text("Attach a file").valign(gtk4::Align::End).build();
         let gif_btn = gtk4::Button::builder().label("GIF").css_classes(["circular", "bubo-gif-btn"]).tooltip_text("Send a GIF").valign(gtk4::Align::End).build();
         let bar = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(6).build();
@@ -234,7 +241,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
+        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), scroll_queued: Cell::new(false), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
             pending_box, pending: RefCell::default(), settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         v
     }
@@ -247,8 +254,19 @@ impl ChatsView {
             self.thread_scroll.vadjustment().connect_value_changed(move |_| { if let Some(me) = me.upgrade() { me.on_thread_scrolled(); } });
             let me = Rc::downgrade(self);
             // Row heights only become known after layout, so the range (`upper`) changes some time
-            // after rows are appended. Apply the pending scroll target on every such change.
-            self.thread_scroll.vadjustment().connect_changed(move |_| { if let Some(me) = me.upgrade() { me.apply_scroll_target(); } });
+            // after rows are appended. Apply the pending scroll target on every such change — on
+            // the next frame: `changed` fires at the end of the viewport's allocation, after the
+            // rows were placed, so moving the value from inside it leaves the rows drawn at the
+            // old offset (a new message half hidden under the composer, with nowhere to scroll).
+            self.thread_scroll.vadjustment().connect_changed(move |_| {
+                let Some(me) = me.upgrade() else { return };
+                if me.scroll_queued.replace(true) { return; }
+                let weak = Rc::downgrade(&me);
+                me.thread_scroll.add_tick_callback(move |_, _| {
+                    if let Some(me) = weak.upgrade() { me.scroll_queued.set(false); me.apply_scroll_target(); }
+                    glib::ControlFlow::Break
+                });
+            });
         }
         // notification click → focus window and open that conversation
         if let Some(n) = &self.notifier {
@@ -273,14 +291,17 @@ impl ChatsView {
         self.list.connect_row_selected(move |_, row| {
             let Some(row) = row else { return };
             let id = unsafe { row.data::<String>("conv-id").map(|p| p.as_ref().clone()) }.unwrap_or_default();
-            me.open(&id);
+            // `rebuild_list` re-selects the open conversation on every update; re-opening it
+            // would re-render the thread and snap it to the bottom.
+            if me.st.borrow().current.as_deref() == Some(&id) { me.mark_read(&id); } else { me.open(&id); }
         });
         // composer
         let me = self.clone();
-        let keys = gtk4::EventControllerKey::new();
+        // Capture phase: the text view's own handler would otherwise insert the newline first.
+        let keys = gtk4::EventControllerKey::builder().propagation_phase(gtk4::PropagationPhase::Capture).build();
         keys.connect_key_pressed(move |_, key, _, state| {
             let enter = matches!(key, gtk4::gdk::Key::Return | gtk4::gdk::Key::KP_Enter | gtk4::gdk::Key::ISO_Enter);
-            if enter && state.contains(gtk4::gdk::ModifierType::CONTROL_MASK) { me.send_current(); glib::Propagation::Stop } else { glib::Propagation::Proceed }
+            if enter && !state.contains(gtk4::gdk::ModifierType::SHIFT_MASK) { me.send_current(); glib::Propagation::Stop } else { glib::Propagation::Proceed }
         });
         self.entry.add_controller(keys);
         // Paste with files or an image on the clipboard stages them as attachments, like Messages
@@ -437,10 +458,12 @@ impl ChatsView {
         for c in &convs {
             let row = conv_row(c, &self.avatars.borrow());
             self.list.append(&row);
-            if Some(&c.id) == selected.as_ref() { self.list.select_row(Some(&row)); }
             rows.insert(c.id.clone(), row);
         }
+        let sel = selected.and_then(|id| rows.get(&id).cloned());
         self.st.borrow_mut().rows = rows;
+        // Last: selecting runs the selection handler, which may rebuild the list itself.
+        if let Some(row) = sel { self.list.select_row(Some(&row)); }
         self.side_stack.set_visible_child_name(if convs.is_empty() { "empty" } else { "list" });
     }
 
@@ -551,12 +574,17 @@ impl ChatsView {
                 }
             });
         }
-        if conv.unread && !conv.latest_message_id.is_empty() {
-            let c = self.client.clone(); let (id2, mid) = (id.to_string(), conv.latest_message_id.clone());
-            crate::rt::spawn(async move { let _ = c.mark_read(&id2, &mid).await; });
-            if let Some(x) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == id) { x.unread = false; x.unread_count = 0; }
-            self.rebuild_list();
-        }
+        self.mark_read(id);
+    }
+
+    /// Tell the phone the conversation's latest message was seen, and clear its unread badge.
+    fn mark_read(&self, id: &str) {
+        let Some(conv) = self.st.borrow().convs.iter().find(|c| c.id == id).cloned() else { return };
+        if !conv.unread || conv.latest_message_id.is_empty() { return; }
+        let c = self.client.clone(); let (id2, mid) = (id.to_string(), conv.latest_message_id.clone());
+        crate::rt::spawn(async move { let _ = c.mark_read(&id2, &mid).await; });
+        if let Some(x) = self.st.borrow_mut().convs.iter_mut().find(|c| c.id == id) { x.unread = false; x.unread_count = 0; }
+        self.rebuild_list();
     }
 
     fn push_message(self: &Rc<Self>, m: Msg, is_old: bool) {
@@ -589,6 +617,9 @@ impl ChatsView {
 
     fn render_thread(self: &Rc<Self>, target: ScrollTarget) {
         self.scroll_target.set(target);
+        // Destroying the focused widget makes GTK move focus and scroll to wherever it lands.
+        let focus = self.thread.root().and_then(|r| r.focus());
+        if focus.is_some_and(|f| f.is_ancestor(&self.thread)) { self.entry.grab_focus(); }
         while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
         let st = self.st.borrow();
         let Some(cur) = &st.current else { return };
