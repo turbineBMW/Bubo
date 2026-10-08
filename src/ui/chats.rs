@@ -61,7 +61,9 @@ pub struct ChatsView {
     /// photo for, so we don't ask again every reload.
     avatars: Rc<RefCell<HashMap<String, Option<gtk4::gdk::Texture>>>>,
     thread_title: adw::WindowTitle,
-    entry: gtk4::TextView,
+    entry: sourceview5::View,
+    /// Spell checking for the composer's buffer: underlines, plus suggestions in its context menu.
+    spelling: libspelling::TextBufferAdapter,
     emoji_btn: gtk4::Button,
     send: gtk4::Button,
     attach: gtk4::Button,
@@ -174,8 +176,18 @@ impl ChatsView {
         let thread_title = adw::WindowTitle::new("", "");
         // Multi-line composer: Enter sends, Shift+Enter inserts a newline. The text view grows with
         // its content up to a cap, then scrolls; the buttons sit at the bottom edge either way.
-        let entry = gtk4::TextView::builder().wrap_mode(gtk4::WrapMode::WordChar).hexpand(true).accepts_tab(false)
+        // A GtkSourceView only so libspelling can check it; without a style scheme it draws
+        // like a plain text view and leaves the frame's colours alone.
+        let buffer = sourceview5::Buffer::builder().highlight_syntax(false).build();
+        sourceview5::prelude::BufferExt::set_style_scheme(&buffer, None);
+        let entry = sourceview5::View::builder().buffer(&buffer).wrap_mode(gtk4::WrapMode::WordChar).hexpand(true).accepts_tab(false)
             .top_margin(7).bottom_margin(7).left_margin(10).right_margin(10).css_classes(["bubo-entry"]).build();
+        let settings = Rc::new(RefCell::new(crate::settings::Settings::load()));
+        // Enchant picks the dictionary from the locale; with none installed nothing is underlined.
+        let spelling = libspelling::TextBufferAdapter::new(&buffer, &libspelling::Checker::default());
+        entry.set_extra_menu(Some(&spelling.menu_model()));
+        entry.insert_action_group("spelling", Some(&spelling));
+        spelling.set_enabled(settings.borrow().spell_check);
         let placeholder = gtk4::Label::builder().label("Message").halign(gtk4::Align::Start).valign(gtk4::Align::Start)
             .margin_start(10).margin_top(7).can_target(false).css_classes(["dim-label"]).build();
         let overlay = gtk4::Overlay::builder().child(&entry).build();
@@ -241,8 +253,8 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), scroll_queued: Cell::new(false), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
-            pending_box, pending: RefCell::default(), settings: Rc::new(RefCell::new(crate::settings::Settings::load())), notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
+        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), scroll_queued: Cell::new(false), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, spelling, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
+            pending_box, pending: RefCell::default(), settings, notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
         v
     }
 
@@ -316,6 +328,13 @@ impl ChatsView {
             if !files && !image { return; }
             tv.stop_signal_emission_by_name("paste-clipboard");
             me.paste_attachments(cb, files);
+        });
+        // The context menu has its own "Check Spelling" toggle, so the adapter is the one place
+        // the choice lives; Preferences flips it too, and either way it is saved from here.
+        let me = self.clone();
+        self.spelling.connect_enabled_notify(move |a| {
+            let mut settings = me.settings.borrow_mut();
+            if settings.spell_check != a.is_enabled() { settings.spell_check = a.is_enabled(); settings.save(); }
         });
         let me = self.clone();
         self.send.connect_clicked(move |_| me.send_current());
@@ -1221,6 +1240,13 @@ impl ChatsView {
         appearance.add(&follow);
         appearance.set_visible(crate::omarchy::detected());
         page.add(&appearance);
+        let composing = adw::PreferencesGroup::builder().title("Composing").build();
+        let spell = adw::SwitchRow::builder().title("Check spelling").subtitle("Underline misspelled words while typing")
+            .active(self.spelling.is_enabled()).build();
+        let spelling = self.spelling.clone();
+        spell.connect_active_notify(move |row| spelling.set_enabled(row.is_active()));
+        composing.add(&spell);
+        page.add(&composing);
         let group = adw::PreferencesGroup::builder().title("Notifications")
             .description("The sound is requested from your notification daemon, which decides whether to play it — so do-not-disturb rules in your shell still apply.").build();
         let choices = gtk4::StringList::new(&["System default", "Custom file", "None"]);
