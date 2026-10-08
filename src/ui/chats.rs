@@ -489,7 +489,7 @@ impl ChatsView {
     /// Ask the phone for contact photos of every conversation participant we haven't resolved
     /// yet, and refresh the list when they land.
     fn fetch_avatars(self: &Rc<Self>) {
-        let ids: Vec<String> = self.st.borrow().convs.iter().flat_map(|c| c.participant_ids.iter().cloned()).collect();
+        let ids: Vec<String> = self.st.borrow().convs.iter().flat_map(|c| c.members.iter().map(|m| m.id.clone())).collect();
         let me = Rc::downgrade(self);
         self.request_avatars(ids, false, move || { if let Some(me) = me.upgrade() { me.refresh_avatars_in_place(); } });
     }
@@ -554,8 +554,8 @@ impl ChatsView {
         let avatars = self.avatars.borrow();
         for c in &st.convs {
             let Some(row) = st.rows.get(&c.id) else { continue };
-            let Some(tex) = c.participant_ids.iter().find_map(|p| avatars.get(p).cloned().flatten()) else { continue };
-            if let Some(av) = find_avatar(row.upcast_ref()) { av.set_custom_image(Some(&tex)); }
+            let Some(slot) = (unsafe { row.data::<gtk4::Overlay>("avatar-slot").map(|o| o.as_ref().clone()) }) else { continue };
+            slot.set_child(Some(&conv_avatar(c, LIST_AVATAR, &avatars)));
         }
     }
 
@@ -1299,14 +1299,8 @@ impl ChatsView {
 /// together stand exactly as tall as the avatar, with the time top-right and an unread badge
 /// pinned to the avatar's corner (blank for one unread message, a count for more).
 fn conv_row(c: &Conv, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> gtk4::ListBoxRow {
-    const SIZE: i32 = 40;
-    let avatar = adw::Avatar::new(SIZE, Some(&c.name), true);
-    if c.is_group { avatar.set_icon_name(Some("system-users-symbolic")); }
-    // First participant with a contact photo wins (for groups too — matches the phone's habit).
-    if let Some(tex) = c.participant_ids.iter().find_map(|p| avatars.get(p).cloned().flatten()) {
-        avatar.set_custom_image(Some(&tex));
-    }
-    let overlay = gtk4::Overlay::builder().child(&avatar).valign(gtk4::Align::Center).build();
+    const SIZE: i32 = LIST_AVATAR;
+    let overlay = gtk4::Overlay::builder().child(&conv_avatar(c, SIZE, avatars)).valign(gtk4::Align::Center).build();
     if c.unread {
         let badge = gtk4::Label::builder().css_classes(["bubo-badge"]).halign(gtk4::Align::End).valign(gtk4::Align::End).build();
         if c.unread_count > 1 { badge.set_label(&c.unread_count.to_string()); }
@@ -1332,7 +1326,7 @@ fn conv_row(c: &Conv, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> 
     let row_box = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(12).build();
     row_box.append(&overlay); row_box.append(&col);
     let row = gtk4::ListBoxRow::builder().child(&row_box).build();
-    unsafe { row.set_data("conv-id", c.id.clone()); }
+    unsafe { row.set_data("conv-id", c.id.clone()); row.set_data("avatar-slot", overlay.clone()); }
 
     // Right-click (or long-press) → context menu. Actions live in the "conv" group on the list.
     let menu = gtk4::gio::Menu::new();
@@ -1358,6 +1352,46 @@ fn conv_row(c: &Conv, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> 
     row
 }
 
+/// Side of a conversation's picture in the sidebar.
+const LIST_AVATAR: i32 = 40;
+
+/// One person's picture: their contact photo if the phone has one, otherwise their initials if
+/// they're in the address book, otherwise a blank silhouette (initials of a phone number are noise).
+fn person_avatar(size: i32, name: &str, id: &str, is_contact: bool, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> adw::Avatar {
+    // The text also seeds the background colour, so give bare numbers their id to vary it.
+    let av = adw::Avatar::new(size, Some(if name.is_empty() { id } else { name }), is_contact);
+    if let Some(Some(tex)) = avatars.get(id) { av.set_custom_image(Some(tex)); }
+    av
+}
+
+/// A conversation's picture: the other person's for a 1:1 chat, and for a group a mosaic of up
+/// to four members' pictures packed into the same circle, Google-Messages style.
+fn conv_avatar(c: &Conv, size: i32, avatars: &HashMap<String, Option<gtk4::gdk::Texture>>) -> gtk4::Widget {
+    if !c.is_group || c.members.len() < 2 {
+        let Some(m) = c.members.first() else {
+            let av = adw::Avatar::new(size, Some(&c.name), false);
+            if c.is_group { av.set_icon_name(Some("system-users-symbolic")); }
+            return av.upcast();
+        };
+        // The conversation name is how the phone labels the person, so take initials from it.
+        let name = if c.is_group { &m.name } else { &c.name };
+        return person_avatar(size, name, &m.id, m.is_contact, avatars).upcast();
+    }
+    let (s, spots) = match c.members.len() {
+        // Two: diagonal, top-left to bottom-right, just clear of each other.
+        2 => { let s = size * 11 / 20; (s, vec![(0, 0), (size - s, size - s)]) }
+        // Three: one on top, two below.
+        3 => { let s = size / 2; (s, vec![((size - s) / 2, 0), (0, size - s), (size - s, size - s)]) }
+        // Four or more: a 2x2 grid of the first four.
+        _ => { let s = size / 2 - 1; (s, vec![(0, 0), (size - s, 0), (0, size - s), (size - s, size - s)]) }
+    };
+    let grid = gtk4::Fixed::builder().width_request(size).height_request(size).build();
+    for (m, (x, y)) in c.members.iter().zip(spots) {
+        grid.put(&person_avatar(s, &m.name, &m.id, m.is_contact, avatars), x as f64, y as f64);
+    }
+    grid.upcast()
+}
+
 impl ChatsView {
     fn bubble(self: &Rc<Self>, m: &Msg, group: bool, self_ids: &[String]) -> gtk4::ListBoxRow {
     let halign = if m.from_me { gtk4::Align::End } else { gtk4::Align::Start };
@@ -1366,8 +1400,7 @@ impl ChatsView {
     // Group chats: attribute each message Google-Messages style — a small contact photo and the
     // sender's full name in their avatar colour, sitting above the bubble rather than inside it.
     if group && !m.from_me && !m.sender_full.is_empty() {
-        let av = adw::Avatar::new(24, Some(&m.sender_full), true);
-        if let Some(tex) = self.avatars.borrow().get(&m.sender_id).cloned().flatten() { av.set_custom_image(Some(&tex)); }
+        let av = person_avatar(24, &m.sender_full, &m.sender_id, m.sender_is_contact, &self.avatars.borrow());
         let name = gtk4::Label::builder().label(&m.sender_full).xalign(0.0).css_classes(["caption", "heading"]).build();
         if m.sender_color.len() == 7 && m.sender_color.starts_with('#') {
             name.set_markup(&format!("<span foreground=\"{}\">{}</span>", m.sender_color, glib::markup_escape_text(&m.sender_full)));
