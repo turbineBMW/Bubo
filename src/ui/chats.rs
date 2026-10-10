@@ -765,8 +765,9 @@ impl ChatsView {
 }
 
 impl ChatsView {
-    /// GIF search popover on the composer's GIF button: a debounced DuckDuckGo search filling a
-    /// grid of thumbnails; clicking one downloads the GIF and sends it like any attachment.
+    /// GIF search popover on the composer's GIF button: a debounced KLIPY search filling a
+    /// grid of animated previews; clicking one downloads the GIF and sends it like any attachment.
+    /// With the search empty, the grid shows the GIFs sent most recently.
     fn build_gif_picker(self: &Rc<Self>) {
         let pop = gtk4::Popover::builder().width_request(372).build();
         pop.set_parent(&self.gif_btn);
@@ -778,8 +779,18 @@ impl ChatsView {
         let col = gtk4::Box::builder().orientation(gtk4::Orientation::Vertical).spacing(6).build();
         col.append(&search); col.append(&status); col.append(&scroll);
         pop.set_child(Some(&col));
-        let s = search.clone();
-        pop.connect_show(move |_| { s.grab_focus(); });
+        let show_recent: Rc<dyn Fn()> = {
+            let (me, grid, status) = (self.clone(), grid.clone(), status.clone());
+            Rc::new(move || {
+                Self::clear_flow(&grid);
+                let recent = crate::gif::history();
+                status.set_label(if recent.is_empty() { "Type to search" } else { "Recently sent" });
+                status.set_visible(true);
+                for g in recent { grid.append(&me.gif_tile(g)); }
+            })
+        };
+        let (s, recent) = (search.clone(), show_recent.clone());
+        pop.connect_show(move |_| { s.grab_focus(); if s.text().trim().is_empty() { recent(); } });
         let p = pop.clone();
         self.gif_btn.connect_clicked(move |_| p.popup());
 
@@ -793,13 +804,14 @@ impl ChatsView {
             let query = e.text().to_string();
             generation.set(generation.get() + 1);
             let my_gen = generation.get();
-            if query.trim().is_empty() { status.set_label("Type to search"); status.set_visible(true); Self::clear_flow(grid); return; }
+            if query.trim().is_empty() { show_recent(); return; }
             let (generation, status, grid, me) = (generation.clone(), status.clone(), grid.clone(), me.clone());
             glib::timeout_add_local_once(std::time::Duration::from_millis(350), move || {
                 if generation.get() != my_gen { return; }
                 status.set_label("Searching…"); status.set_visible(true);
                 let (tx, rx) = async_channel::bounded(1);
-                crate::rt::spawn(async move { let _ = tx.send(crate::gif::search(&query, 0).await).await; });
+                let key = me.settings.borrow().klipy_api_key.clone();
+                crate::rt::spawn(async move { let _ = tx.send(crate::gif::search(&key, &query, 0).await).await; });
                 glib::spawn_future_local(async move {
                     let Ok(res) = rx.recv().await else { return };
                     if generation.get() != my_gen { return; }
@@ -816,9 +828,9 @@ impl ChatsView {
         // Popover clicks route via the tile's stored URL; close the popover once a GIF is chosen.
         let me = self.clone();
         grid.connect_child_activated(move |_, child| {
-            let Some(url) = (unsafe { child.child().and_then(|c| c.data::<String>("gif-url")).map(|u| u.as_ref().clone()) }) else { return };
+            let Some(gif) = (unsafe { child.child().and_then(|c| c.data::<crate::gif::Gif>("gif")).map(|g| g.as_ref().clone()) }) else { return };
             p.popdown();
-            me.send_gif(url);
+            me.send_gif(gif);
         });
     }
 
@@ -826,20 +838,27 @@ impl ChatsView {
         while let Some(c) = grid.first_child() { grid.remove(&c); }
     }
 
-    /// A grid tile: a fixed-size picture whose thumbnail loads in the background.
+    /// A grid tile: a fixed-size picture that shows the still while the animated preview loads in
+    /// the background, then plays the preview.
     fn gif_tile(self: &Rc<Self>, g: crate::gif::Gif) -> gtk4::Widget {
         let pic = gtk4::Picture::builder().content_fit(gtk4::ContentFit::Cover).can_shrink(true).overflow(gtk4::Overflow::Hidden).build();
         pic.set_size_request(112, 112);
         let btn = gtk4::Button::builder().child(&pic).css_classes(["flat", "bubo-gif-tile"]).tooltip_text(&g.url).build();
-        unsafe { btn.set_data("gif-url", g.url.clone()); }
-        let thumb = g.thumbnail.clone();
-        let (tx, rx) = async_channel::bounded(1);
-        crate::rt::spawn(async move { let _ = tx.send(crate::gif::thumbnail(&thumb).await).await; });
+        let (still, preview) = (g.still.clone(), g.preview.clone());
+        unsafe { btn.set_data("gif", g); }
+        // The still is tiny, so it lands first; the preview replaces it once downloaded.
+        let (tx, rx) = async_channel::bounded(2);
+        crate::rt::spawn(async move {
+            if !still.is_empty() && let Ok(b) = crate::gif::thumbnail(&still).await { let _ = tx.send((false, b)).await; }
+            if let Ok(b) = crate::gif::thumbnail(&preview).await { let _ = tx.send((true, b)).await; }
+        });
         let weak = pic.downgrade();
         glib::spawn_future_local(async move {
-            let Ok(Ok(bytes)) = rx.recv().await else { return };
-            let Some(pic) = weak.upgrade() else { return };
-            if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&bytes)) { pic.set_paintable(Some(&tex)); }
+            while let Ok((animated, bytes)) = rx.recv().await {
+                let Some(pic) = weak.upgrade() else { return };
+                if animated && Self::play_gif(&pic, &bytes).is_ok() { continue; }
+                if let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(&bytes)) { pic.set_paintable(Some(&tex)); }
+            }
         });
         // FlowBox activates the child on click; the button itself just needs to not swallow it.
         let btn2 = btn.clone();
@@ -847,13 +866,14 @@ impl ChatsView {
         btn.upcast()
     }
 
-    /// Download a GIF by URL, upload it, and send it (with any composer text as caption).
-    fn send_gif(self: &Rc<Self>, url: String) {
+    /// Download a GIF, upload it, and send it (with any composer text as caption). Once sent, it
+    /// joins the picker's history.
+    fn send_gif(self: &Rc<Self>, gif: crate::gif::Gif) {
         let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
         let Some(conv) = conv else { return };
         self.toast.add_toast(adw::Toast::new("Sending GIF…"));
         let (tx, rx) = async_channel::bounded(1);
-        let (c, cid, pid, caption) = (self.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), self.entry_text());
+        let (c, cid, pid, caption, url) = (self.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), self.entry_text(), gif.url.clone());
         self.entry.buffer().set_text("");
         crate::rt::spawn(async move {
             let r = async {
@@ -865,7 +885,11 @@ impl ChatsView {
         });
         let me = self.clone();
         glib::spawn_future_local(async move {
-            if let Ok(Err(e)) = rx.recv().await { me.toast.add_toast(adw::Toast::new(&format!("GIF send failed: {e:#}"))); }
+            match rx.recv().await {
+                Ok(Ok(())) => crate::gif::remember(&gif),
+                Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("GIF send failed: {e:#}"))),
+                Err(_) => {}
+            }
         });
     }
 
@@ -1248,6 +1272,14 @@ impl ChatsView {
         spell.connect_active_notify(move |row| spelling.set_enabled(row.is_active()));
         composing.add(&spell);
         page.add(&composing);
+        let gifs = adw::PreferencesGroup::builder().title("GIFs")
+            .description("GIF search uses KLIPY. Get a free API key at partner.klipy.com and paste it here.").build();
+        let key = adw::PasswordEntryRow::builder().title("KLIPY API key").show_apply_button(true).build();
+        key.set_text(&self.settings.borrow().klipy_api_key);
+        let me = self.clone();
+        key.connect_apply(move |row| { let mut s = me.settings.borrow_mut(); s.klipy_api_key = row.text().trim().to_string(); s.save(); });
+        gifs.add(&key);
+        page.add(&gifs);
         let group = adw::PreferencesGroup::builder().title("Notifications")
             .description("The sound is requested from your notification daemon, which decides whether to play it — so do-not-disturb rules in your shell still apply.").build();
         let choices = gtk4::StringList::new(&["System default", "Custom file", "None"]);
@@ -1648,32 +1680,43 @@ impl ChatsView {
             pic.set_size_request((w * k).round() as i32, (h * k).round() as i32);
         };
         if bytes.starts_with(b"GIF8") {
-            use gtk4::gdk_pixbuf::{PixbufAnimation, PixbufLoader};
-            let loader = PixbufLoader::new();
-            loader.write(bytes)?;
-            loader.close()?;
-            let anim: PixbufAnimation = loader.animation().ok_or_else(|| anyhow::anyhow!("no animation"))?;
-            fit(&pic, anim.width(), anim.height());
-            let iter = anim.iter(None);
-            pic.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&iter.pixbuf())));
-            if !anim.is_static_image() {
-                fn tick(pic: glib::WeakRef<gtk4::Picture>, iter: gtk4::gdk_pixbuf::PixbufAnimationIter) {
-                    let delay = iter.delay_time().unwrap_or(std::time::Duration::from_millis(100)).max(std::time::Duration::from_millis(20));
-                    glib::timeout_add_local_once(delay, move || {
-                        let Some(p) = pic.upgrade() else { return };
-                        iter.advance(std::time::SystemTime::now());
-                        p.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&iter.pixbuf())));
-                        tick(pic, iter);
-                    });
-                }
-                tick(pic.downgrade(), iter);
-            }
+            let (w, h) = Self::play_gif(&pic, bytes)?;
+            fit(&pic, w, h);
         } else {
             let tex = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(bytes))?;
             fit(&pic, tex.width(), tex.height());
             pic.set_paintable(Some(&tex));
         }
         Ok(pic)
+    }
+
+    /// Show a GIF on `pic` and animate it for as long as the picture lives: frames are pulled from
+    /// a PixbufAnimation on a timer, and only advance while the picture is on screen. Returns the
+    /// GIF's size.
+    fn play_gif(pic: &gtk4::Picture, bytes: &[u8]) -> anyhow::Result<(i32, i32)> {
+        use gtk4::gdk_pixbuf::{PixbufAnimation, PixbufLoader};
+        if !bytes.starts_with(b"GIF8") { anyhow::bail!("not a GIF"); }
+        let loader = PixbufLoader::new();
+        loader.write(bytes)?;
+        loader.close()?;
+        let anim: PixbufAnimation = loader.animation().ok_or_else(|| anyhow::anyhow!("no animation"))?;
+        let iter = anim.iter(None);
+        pic.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+        if !anim.is_static_image() {
+            fn tick(pic: glib::WeakRef<gtk4::Picture>, iter: gtk4::gdk_pixbuf::PixbufAnimationIter) {
+                let delay = iter.delay_time().unwrap_or(std::time::Duration::from_millis(100)).max(std::time::Duration::from_millis(20));
+                glib::timeout_add_local_once(delay, move || {
+                    let Some(p) = pic.upgrade() else { return };
+                    if p.is_mapped() {
+                        iter.advance(std::time::SystemTime::now());
+                        p.set_paintable(Some(&gtk4::gdk::Texture::for_pixbuf(&iter.pixbuf())));
+                    }
+                    tick(pic, iter);
+                });
+            }
+            tick(pic.downgrade(), iter);
+        }
+        Ok((anim.width(), anim.height()))
     }
 
     /// A clickable attachment: images load inline on click; other files save to ~/Downloads.

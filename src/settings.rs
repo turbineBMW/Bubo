@@ -31,11 +31,13 @@ pub struct Settings {
     pub start_at_login: bool,
     /// The one-time notice that closing left Bubo running has been shown.
     pub background_notice_shown: bool,
+    /// The user's own KLIPY key for GIF search (see `gif`); empty until they add one.
+    pub klipy_api_key: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true, run_in_background: false, start_at_login: false, background_notice_shown: false }
+        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true, run_in_background: false, start_at_login: false, background_notice_shown: false, klipy_api_key: String::new() }
     }
 }
 
