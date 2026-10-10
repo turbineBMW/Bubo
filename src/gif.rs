@@ -5,6 +5,7 @@
 //! person searching fits comfortably but a shared key would not.
 use anyhow::{Context, Result, anyhow};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 const API: &str = "https://api.klipy.com/api/v1";
@@ -12,13 +13,18 @@ const API: &str = "https://api.klipy.com/api/v1";
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
 /// KLIPY allows 8–50; the picker grid shows up to 45.
 const PER_PAGE: u32 = 45;
+/// How many recently sent GIFs the picker remembers.
+const HISTORY_LEN: usize = 45;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Gif {
-    /// Direct URL to the animated GIF.
+    /// Direct URL to the animated GIF that gets sent.
     pub url: String,
-    /// Small static preview, good for a picker grid.
-    pub thumbnail: String,
+    /// Small animated GIF for the picker grid.
+    pub preview: String,
+    /// A still of the preview, shown while it loads; empty if KLIPY had none.
+    #[serde(default)]
+    pub still: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -53,14 +59,15 @@ impl Item {
         self.file.get(size)?.get(format).filter(|f| f.url.starts_with("http"))
     }
 
-    /// The biggest rendition that is still small enough to send, plus a still for the grid.
+    /// The biggest rendition that is still small enough to send, plus a small animated preview
+    /// (`sm` is ~220px, sharp in a 112px tile on HiDPI) and its still for the grid.
     /// Ads (`type: "ad"`) are skipped.
     fn to_gif(&self) -> Option<Gif> {
         if self.kind == "ad" { return None; }
         let url = ["hd", "md", "sm", "xs"].iter().filter_map(|s| self.file(s, "gif")).find(|f| f.size as usize <= MAX_BYTES)?.url.clone();
-        let thumbnail = [("sm", "jpg"), ("xs", "jpg"), ("sm", "gif"), ("xs", "gif")].iter().find_map(|(s, f)| self.file(s, f))
-            .map_or_else(|| url.clone(), |f| f.url.clone());
-        Some(Gif { url, thumbnail })
+        let preview = ["sm", "xs"].iter().find_map(|s| self.file(s, "gif")).map_or_else(|| url.clone(), |f| f.url.clone());
+        let still = ["sm", "xs"].iter().find_map(|s| self.file(s, "jpg")).map(|f| f.url.clone()).unwrap_or_default();
+        Some(Gif { url, preview, still })
     }
 }
 
@@ -98,6 +105,33 @@ pub async fn search(api_key: &str, query: &str, page: u32) -> Result<Vec<Gif>> {
     Ok(body.data.map(|d| d.data.iter().filter_map(Item::to_gif).collect()).unwrap_or_default())
 }
 
+fn history_path() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "turbinebmw", "bubo").map(|d| d.data_dir().join("gif-history.json"))
+}
+
+/// GIFs this user has sent, most recent first. Kept locally; nothing is reported to KLIPY.
+pub fn history() -> Vec<Gif> {
+    history_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// Move `gif` to the front of the history, dropping any older copy and the oldest beyond the cap.
+fn push_recent(list: &mut Vec<Gif>, gif: &Gif) {
+    list.retain(|g| g.url != gif.url);
+    list.insert(0, gif.clone());
+    list.truncate(HISTORY_LEN);
+}
+
+/// Record a sent GIF in the history.
+pub fn remember(gif: &Gif) {
+    let Some(path) = history_path() else { return };
+    let mut list = history();
+    push_recent(&mut list, gif);
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    if let Err(e) = serde_json::to_vec(&list).map_err(anyhow::Error::from).and_then(|b| std::fs::write(&path, b).map_err(Into::into)) {
+        tracing::warn!("saving GIF history: {e:#}");
+    }
+}
+
 /// Download a GIF's bytes, checking that it actually is one.
 pub async fn download(url: &str) -> Result<Vec<u8>> {
     let resp = http().get(url).send().await?.error_for_status()?;
@@ -108,7 +142,7 @@ pub async fn download(url: &str) -> Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Fetch a preview thumbnail (any image format).
+/// Fetch a grid preview or still (any image format).
 pub async fn thumbnail(url: &str) -> Result<Vec<u8>> {
     Ok(http().get(url).send().await?.error_for_status()?.bytes().await?.to_vec())
 }
@@ -129,7 +163,20 @@ mod tests {
         let gifs: Vec<Gif> = body.data.unwrap().data.iter().filter_map(Item::to_gif).collect();
         assert_eq!(gifs.len(), 1);
         assert_eq!(gifs[0].url, "https://x/md.gif");
-        assert_eq!(gifs[0].thumbnail, "https://x/sm.jpg");
+        assert_eq!(gifs[0].preview, "https://x/sm.gif");
+        assert_eq!(gifs[0].still, "https://x/sm.jpg");
+    }
+
+    #[test]
+    fn history_is_newest_first_without_duplicates() {
+        let gif = |n: usize| Gif { url: format!("https://x/{n}.gif"), preview: String::new(), still: String::new() };
+        let mut list = Vec::new();
+        for n in 0..HISTORY_LEN + 5 { push_recent(&mut list, &gif(n)); }
+        assert_eq!(list.len(), HISTORY_LEN);
+        assert_eq!(list[0], gif(HISTORY_LEN + 4));
+        push_recent(&mut list, &gif(HISTORY_LEN));
+        assert_eq!(list[0], gif(HISTORY_LEN));
+        assert_eq!(list.iter().filter(|g| **g == gif(HISTORY_LEN)).count(), 1);
     }
 
     #[test]
