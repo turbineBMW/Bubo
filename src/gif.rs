@@ -1,73 +1,101 @@
-//! Keyless GIF search over DuckDuckGo's image search (`f=type:gif`).
+//! GIF search over KLIPY's API (https://docs.klipy.com).
 //!
-//! DDG's image endpoint is undocumented: a page load yields a `vqd` token that unlocks `/i.js`
-//! JSON results. The token is cached here and refreshed on the first failure. No API key,
-//! no account — the trade is that a DDG-side change can break this without notice.
+//! Each user brings their own free API key from partner.klipy.com, set in Preferences — a key
+//! can't be shipped in the source, and test keys are capped at 100 requests an hour, which one
+//! person searching fits comfortably but a shared key would not.
 use anyhow::{Context, Result, anyhow};
-use std::sync::{Mutex, OnceLock};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
-const UA: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+const API: &str = "https://api.klipy.com/api/v1";
 /// Refuse GIFs larger than this — MMS carriers reject big attachments anyway.
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
+/// KLIPY allows 8–50; the picker grid shows up to 45.
+const PER_PAGE: u32 = 45;
 
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Gif {
     /// Direct URL to the animated GIF.
-    #[serde(rename = "image")]
     pub url: String,
     /// Small static preview, good for a picker grid.
     pub thumbnail: String,
 }
 
 #[derive(serde::Deserialize)]
-struct Page { results: Vec<Gif> }
+struct Response {
+    #[serde(default)]
+    result: bool,
+    data: Option<Data>,
+    errors: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct Data { data: Vec<Item> }
+
+#[derive(serde::Deserialize)]
+struct Item {
+    #[serde(default, rename = "type")]
+    kind: String,
+    /// Size (`hd`, `md`, `sm`, `xs`) → format (`gif`, `jpg`, …) → file.
+    #[serde(default)]
+    file: HashMap<String, HashMap<String, File>>,
+}
+
+#[derive(serde::Deserialize)]
+struct File {
+    url: String,
+    #[serde(default)]
+    size: u64,
+}
+
+impl Item {
+    fn file(&self, size: &str, format: &str) -> Option<&File> {
+        self.file.get(size)?.get(format).filter(|f| f.url.starts_with("http"))
+    }
+
+    /// The biggest rendition that is still small enough to send, plus a still for the grid.
+    /// Ads (`type: "ad"`) are skipped.
+    fn to_gif(&self) -> Option<Gif> {
+        if self.kind == "ad" { return None; }
+        let url = ["hd", "md", "sm", "xs"].iter().filter_map(|s| self.file(s, "gif")).find(|f| f.size as usize <= MAX_BYTES)?.url.clone();
+        let thumbnail = [("sm", "jpg"), ("xs", "jpg"), ("sm", "gif"), ("xs", "gif")].iter().find_map(|(s, f)| self.file(s, f))
+            .map_or_else(|| url.clone(), |f| f.url.clone());
+        Some(Gif { url, thumbnail })
+    }
+}
 
 fn http() -> &'static reqwest::Client {
     static C: OnceLock<reqwest::Client> = OnceLock::new();
-    C.get_or_init(|| reqwest::Client::builder().user_agent(UA).timeout(std::time::Duration::from_secs(20)).build().expect("gif http client"))
+    C.get_or_init(|| reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().expect("gif http client"))
 }
 
-fn vqd_cache() -> &'static Mutex<Option<String>> {
-    static V: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    V.get_or_init(|| Mutex::new(None))
+/// KLIPY's `{"errors": {"message": ["…"]}}`, flattened to one line.
+fn error_message(errors: &serde_json::Value) -> Option<String> {
+    let msgs: Vec<&str> = match errors {
+        serde_json::Value::Object(m) => m.values().flat_map(|v| v.as_array().into_iter().flatten().filter_map(|s| s.as_str()).chain(v.as_str())).collect(),
+        serde_json::Value::String(s) => vec![s.as_str()],
+        _ => vec![],
+    };
+    (!msgs.is_empty()).then(|| msgs.join(" "))
 }
 
-async fn fetch_vqd(query: &str) -> Result<String> {
-    let html = http().get("https://duckduckgo.com/").query(&[("q", query), ("iax", "images"), ("ia", "images")]).send().await?.error_for_status()?.text().await?;
-    let start = html.find("vqd=").ok_or_else(|| anyhow!("no vqd token in DDG page"))? + 4;
-    // Appears both as `vqd="4-…"` and `vqd=4-…`; accept either.
-    let tok: String = html[start..].trim_start_matches(['"', '\'']).chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
-    if tok.is_empty() { return Err(anyhow!("empty vqd token")); }
-    Ok(tok)
-}
-
-async fn vqd(query: &str, refresh: bool) -> Result<String> {
-    if !refresh && let Some(v) = vqd_cache().lock().unwrap().clone() { return Ok(v); }
-    let v = fetch_vqd(query).await?;
-    *vqd_cache().lock().unwrap() = Some(v.clone());
-    Ok(v)
-}
-
-/// Search GIFs; `page` is zero-based (DDG hands back ~50–100 per page).
-pub async fn search(query: &str, page: u32) -> Result<Vec<Gif>> {
+/// Search GIFs; `page` is zero-based.
+pub async fn search(api_key: &str, query: &str, page: u32) -> Result<Vec<Gif>> {
     let query = query.trim();
     if query.is_empty() { return Ok(vec![]); }
-    let mut refresh = false;
-    for attempt in 0..2 {
-        let tok = vqd(query, refresh).await?;
-        let resp = http().get("https://duckduckgo.com/i.js")
-            .header("Referer", "https://duckduckgo.com/")
-            .query(&[("l", "us-en"), ("o", "json"), ("q", query), ("vqd", &tok), ("f", "type:gif"), ("p", "1"), ("s", &(page * 100).to_string())])
-            .send().await?;
-        if resp.status().is_success() {
-            let page: Page = resp.json().await.context("DDG results JSON")?;
-            return Ok(page.results.into_iter().filter(|g| g.url.starts_with("http")).collect());
-        }
-        // 403 means the token went stale (or we're rate-limited); one refresh, then give up.
-        tracing::debug!(status = %resp.status(), attempt, "DDG image search rejected");
-        refresh = true;
+    let api_key = api_key.trim();
+    if api_key.is_empty() { return Err(anyhow!("Add a free KLIPY API key in Preferences to search GIFs")); }
+    let resp = http().get(format!("{API}/{api_key}/gifs/search"))
+        .query(&[("q", query), ("page", &(page + 1).to_string()), ("per_page", &PER_PAGE.to_string()), ("format_filter", "gif,jpg")])
+        .send().await?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS { return Err(anyhow!("KLIPY's hourly search limit was reached — try again later")); }
+    let body: Response = resp.json().await.with_context(|| format!("KLIPY replied {status}"))?;
+    if !status.is_success() || !body.result {
+        let msg = body.errors.as_ref().and_then(error_message).unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(anyhow!("KLIPY: {msg}"));
     }
-    Err(anyhow!("DuckDuckGo refused the search (rate-limited?) — try again in a moment"))
+    Ok(body.data.map(|d| d.data.iter().filter_map(Item::to_gif).collect()).unwrap_or_default())
 }
 
 /// Download a GIF's bytes, checking that it actually is one.
@@ -83,4 +111,30 @@ pub async fn download(url: &str) -> Result<Vec<u8>> {
 /// Fetch a preview thumbnail (any image format).
 pub async fn thumbnail(url: &str) -> Result<Vec<u8>> {
     Ok(http().get(url).send().await?.error_for_status()?.bytes().await?.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_sendable_gif_and_skips_ads() {
+        let body: Response = serde_json::from_str(r#"{"result":true,"data":{"data":[
+            {"id":1,"slug":"a","type":"gif","file":{
+                "hd":{"gif":{"url":"https://x/hd.gif","width":498,"height":498,"size":9999999}},
+                "md":{"gif":{"url":"https://x/md.gif","width":220,"height":220,"size":500000}},
+                "sm":{"gif":{"url":"https://x/sm.gif","size":100000},"jpg":{"url":"https://x/sm.jpg","size":5000}}}},
+            {"id":2,"type":"ad","file":{"md":{"gif":{"url":"https://ad/md.gif","size":1}}}}
+        ],"current_page":1,"per_page":45,"has_next":true}}"#).unwrap();
+        let gifs: Vec<Gif> = body.data.unwrap().data.iter().filter_map(Item::to_gif).collect();
+        assert_eq!(gifs.len(), 1);
+        assert_eq!(gifs[0].url, "https://x/md.gif");
+        assert_eq!(gifs[0].thumbnail, "https://x/sm.jpg");
+    }
+
+    #[test]
+    fn flattens_error_messages() {
+        let body: Response = serde_json::from_str(r#"{"result":false,"errors":{"message":["The provided API key is invalid."]}}"#).unwrap();
+        assert_eq!(error_message(&body.errors.unwrap()).as_deref(), Some("The provided API key is invalid."));
+    }
 }

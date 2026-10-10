@@ -765,7 +765,7 @@ impl ChatsView {
 }
 
 impl ChatsView {
-    /// GIF search popover on the composer's GIF button: a debounced DuckDuckGo search filling a
+    /// GIF search popover on the composer's GIF button: a debounced KLIPY search filling a
     /// grid of thumbnails; clicking one downloads the GIF and sends it like any attachment.
     fn build_gif_picker(self: &Rc<Self>) {
         let pop = gtk4::Popover::builder().width_request(372).build();
@@ -799,7 +799,8 @@ impl ChatsView {
                 if generation.get() != my_gen { return; }
                 status.set_label("Searching…"); status.set_visible(true);
                 let (tx, rx) = async_channel::bounded(1);
-                crate::rt::spawn(async move { let _ = tx.send(crate::gif::search(&query, 0).await).await; });
+                let key = me.settings.borrow().klipy_api_key.clone();
+                crate::rt::spawn(async move { let _ = tx.send(crate::gif::search(&key, &query, 0).await).await; });
                 glib::spawn_future_local(async move {
                     let Ok(res) = rx.recv().await else { return };
                     if generation.get() != my_gen { return; }
@@ -1248,6 +1249,14 @@ impl ChatsView {
         spell.connect_active_notify(move |row| spelling.set_enabled(row.is_active()));
         composing.add(&spell);
         page.add(&composing);
+        let gifs = adw::PreferencesGroup::builder().title("GIFs")
+            .description("GIF search uses KLIPY. Get a free API key at partner.klipy.com and paste it here.").build();
+        let key = adw::PasswordEntryRow::builder().title("KLIPY API key").show_apply_button(true).build();
+        key.set_text(&self.settings.borrow().klipy_api_key);
+        let me = self.clone();
+        key.connect_apply(move |row| { let mut s = me.settings.borrow_mut(); s.klipy_api_key = row.text().trim().to_string(); s.save(); });
+        gifs.add(&key);
+        page.add(&gifs);
         let group = adw::PreferencesGroup::builder().title("Notifications")
             .description("The sound is requested from your notification daemon, which decides whether to play it — so do-not-disturb rules in your shell still apply.").build();
         let choices = gtk4::StringList::new(&["System default", "Custom file", "None"]);
