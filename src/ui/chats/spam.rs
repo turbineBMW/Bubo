@@ -3,7 +3,7 @@
 //! screening itself lives in `crate::spam`.
 use super::ChatsView;
 use crate::settings::{SpamChecker, SpamFilter};
-use crate::spam::{Action, Entry, Judgement, Log};
+use crate::spam::{Action, Entry, Judgement, Log, Lookup};
 use crate::ui::state::{Conv, Msg};
 use adw::prelude::*;
 use gtk4::glib;
@@ -37,8 +37,7 @@ impl Screen {
 
 enum Outcome { Pass, Flag(String), Archived }
 
-fn checker_name(c: SpamChecker) -> &'static str { match c { SpamChecker::Claude => "Claude", SpamChecker::Codex => "Codex" } }
-fn command_name(c: SpamChecker) -> &'static str { match c { SpamChecker::Claude => "claude", SpamChecker::Codex => "codex" } }
+fn flag_label(j: Judgement) -> String { if j == Judgement::Spam { "⚠ Likely spam".into() } else { "⚠ Possible spam".into() } }
 
 impl ChatsView {
     fn filter(&self) -> SpamFilter { self.settings.borrow().spam_filter }
@@ -107,7 +106,7 @@ impl ChatsView {
     async fn check(self: &Rc<Self>, id: &str) -> Outcome {
         let checker = self.settings.borrow().spam_checker;
         let Some(bin) = crate::spam::find(checker) else {
-            self.warn(&format!("Spam filter: the `{}` command isn't installed, so texts aren't being checked.", command_name(checker)));
+            self.warn(&format!("Spam filter: the `{}` command isn't installed, so texts aren't being checked.", checker.command()));
             return Outcome::Pass;
         };
         let context = self.settings.borrow().spam_context.clone();
@@ -116,49 +115,58 @@ impl ChatsView {
         let (c, id2) = (self.client.clone(), id.to_string());
         crate::rt::spawn(async move {
             let r = async {
-                let Some(s) = crate::spam::suspect(&c, &id2).await? else { return anyhow::Ok(None) };
-                // Judged already, and nothing new since.
-                if seen.is_some_and(|t| t >= s.last_ts) { return Ok(None); }
+                let s = match crate::spam::suspect(&c, &id2, seen).await? { Lookup::Suspect(s) => s, other => return anyhow::Ok(Err(other)) };
                 let v = crate::spam::classify(checker, &bin, &context, &s).await;
-                Ok(Some((s, v)))
+                Ok(Ok((s, v)))
             }.await;
             let _ = tx.send(r).await;
         });
         let (s, verdict) = match rx.recv().await {
-            Ok(Ok(Some(found))) => found,
-            Ok(Ok(None)) | Err(_) => return Outcome::Pass,
+            Ok(Ok(Ok(found))) => found,
+            // A message that came in while the last check ran, which saw it too.
+            Ok(Ok(Err(Lookup::Unchanged))) => return self.previous(id),
+            Ok(Ok(Err(_))) | Err(_) => return Outcome::Pass,
             Ok(Err(e)) => { tracing::warn!("spam filter: reading conversation {id}: {e:#}"); return Outcome::Pass }
         };
         let v = match verdict {
             Ok(v) => v,
             Err(e) => {
                 tracing::warn!("spam filter: {e:#}");
-                self.warn(&format!("Spam filter: {} couldn't check a text (see ~/.cache/bubo/bubo.log).", checker_name(checker)));
+                self.warn(&format!("Spam filter: {} couldn't check a text (see ~/.cache/bubo/bubo.log).", checker.label()));
                 return Outcome::Pass;
             }
         };
         let name = if s.name.is_empty() { s.number.clone() } else { s.name.clone() };
         tracing::info!("spam filter: {name} → {:?} ({checker:?}): {}", v.judgement, v.reason);
-        // Don't pull a conversation out from under someone reading it.
+        // Don't pull a conversation out from under someone reading it, or hide a code.
         let reading = self.win.is_active() && self.st.borrow().current.as_deref() == Some(id);
-        let archive = v.judgement == Judgement::Spam && self.filter() == SpamFilter::Archive && !reading;
-        let action = match v.judgement { Judgement::Legit => Action::Passed, _ if archive => Action::Archived, _ => Action::Flagged };
+        let archive = v.judgement == Judgement::Spam && self.filter() == SpamFilter::Archive && !reading && !s.has_code;
+        let mut action = match v.judgement { Judgement::Legit => Action::Passed, _ if archive => Action::Archived, _ => Action::Flagged };
+        if action == Action::Archived && let Err(e) = self.archive(id, &s.latest_message_id).await {
+            tracing::warn!("spam filter: archiving {name}: {e:#}");
+            action = Action::Flagged;
+        }
         let entry = Entry { conversation_id: id.to_string(), name: name.clone(), excerpt: s.excerpt(), judgement: v.judgement, reason: v.reason.clone(),
             checker, date: glib::real_time() / 1_000_000, action };
         self.spam.log.borrow_mut().record(entry, s.last_ts);
         match action {
             Action::Archived => {
-                if let Err(e) = self.archive(id, &s.latest_message_id).await {
-                    tracing::warn!("spam filter: archiving {name}: {e:#}");
-                    return Outcome::Flag("⚠ Likely spam".into());
-                }
                 let toast = adw::Toast::builder().title(format!("Archived {name} as spam")).button_label("Undo").timeout(8).build();
                 let (me, id) = (self.clone(), id.to_string());
-                toast.connect_button_clicked(move |_| me.allow(&id));
+                toast.connect_button_clicked(move |_| me.allow(&id, |_| {}));
                 self.toast.add_toast(toast);
                 Outcome::Archived
             }
-            Action::Flagged => Outcome::Flag(if v.judgement == Judgement::Spam { "⚠ Likely spam".into() } else { "⚠ Possible spam".into() }),
+            Action::Flagged => Outcome::Flag(flag_label(v.judgement)),
+            _ => Outcome::Pass,
+        }
+    }
+
+    /// What the last check of a conversation decided, for a recheck that found nothing new.
+    fn previous(&self, id: &str) -> Outcome {
+        match self.spam.log.borrow().entries.iter().rev().find(|e| e.conversation_id == id) {
+            Some(e) if e.action == Action::Archived => Outcome::Archived,
+            Some(e) if e.action == Action::Flagged => Outcome::Flag(flag_label(e.judgement)),
             _ => Outcome::Pass,
         }
     }
@@ -183,32 +191,44 @@ impl ChatsView {
         Ok(())
     }
 
-    /// Undo: bring the conversation back to the inbox, and never screen it again.
-    fn allow(self: &Rc<Self>, id: &str) {
-        self.spam.log.borrow_mut().allow(id);
+    /// Undo: bring the conversation back to the inbox, and never screen it again. `done` hears
+    /// whether the phone agreed; only then is the log changed.
+    fn allow(self: &Rc<Self>, id: &str, done: impl Fn(bool) + 'static) {
         let (tx, rx) = async_channel::bounded(1);
         let (c, id2) = (self.client.clone(), id.to_string());
         crate::rt::spawn(async move {
             let r = async { c.set_archived(&id2, false).await?; c.get_conversation(&id2).await }.await;
             let _ = tx.send(r).await;
         });
-        let me = self.clone();
+        let (me, id) = (self.clone(), id.to_string());
         glib::spawn_future_local(async move {
-            match rx.recv().await {
-                Ok(Ok(Some(conv))) => { me.upsert_conv(Conv::from_proto(&conv)); me.rebuild_list(); me.fetch_avatars(); }
-                Ok(Ok(None)) | Err(_) => {}
-                Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Could not restore the conversation: {e:#}"))),
+            let Ok(r) = rx.recv().await else { return done(false) };
+            match r {
+                Ok(conv) => {
+                    me.spam.log.borrow_mut().allow(&id);
+                    if let Some(conv) = conv {
+                        // The phone can answer with the old status before the change lands.
+                        let mut conv = Conv::from_proto(&conv);
+                        conv.archived = false;
+                        me.upsert_conv(conv); me.rebuild_list(); me.fetch_avatars();
+                    }
+                    done(true);
+                }
+                Err(e) => { me.toast.add_toast(adw::Toast::new(&format!("Could not restore the conversation: {e:#}"))); done(false); }
             }
         });
     }
 
-    /// Archive a conversation the filter let through or only flagged.
-    fn archive_now(self: &Rc<Self>, id: &str) {
-        self.spam.log.borrow_mut().set_action(id, Action::Archived);
+    /// Archive a conversation the filter let through or only flagged. `done` hears whether the
+    /// phone agreed; only then is the log changed.
+    fn archive_now(self: &Rc<Self>, id: &str, done: impl Fn(bool) + 'static) {
         let mid = self.st.borrow().convs.iter().find(|c| c.id == id).map(|c| c.latest_message_id.clone()).unwrap_or_default();
         let (me, id) = (self.clone(), id.to_string());
         glib::spawn_future_local(async move {
-            if let Err(e) = me.archive(&id, &mid).await { me.toast.add_toast(adw::Toast::new(&format!("Could not archive: {e:#}"))); }
+            match me.archive(&id, &mid).await {
+                Ok(()) => { me.spam.log.borrow_mut().set_action(&id, Action::Archived); done(true); }
+                Err(e) => { me.toast.add_toast(adw::Toast::new(&format!("Could not archive: {e:#}"))); done(false); }
+            }
         });
     }
 
@@ -216,9 +236,9 @@ impl ChatsView {
     pub(super) fn spam_preferences(self: &Rc<Self>, dialog: &adw::PreferencesDialog) -> adw::PreferencesGroup {
         let group = adw::PreferencesGroup::builder().title("Spam filter").build();
         let describe = |g: &adw::PreferencesGroup, c: SpamChecker| g.set_description(Some(&match (crate::spam::find(c).is_some(), c) {
-            (true, SpamChecker::Claude) => "Texts from numbers that aren't in your contacts, in conversations you've never replied to, are checked by Claude Haiku through the claude command. The number, the messages and any pictures are sent to Anthropic. Texts with a verification code are never sent or archived.".to_string(),
-            (true, SpamChecker::Codex) => "Texts from numbers that aren't in your contacts, in conversations you've never replied to, are checked by OpenAI's GPT-6 Luna through the codex command. The number, the messages and any pictures are sent to OpenAI. Texts with a verification code are never sent or archived.".to_string(),
-            (false, c) => format!("Needs the {} command, which wasn't found on PATH or in ~/.local/bin.", command_name(c)),
+            (true, SpamChecker::Claude) => "Texts from numbers that aren't in your contacts, in conversations you've never replied to, are checked by Claude Haiku through the claude command. The number, the messages and any pictures are sent to Anthropic. Texts with a verification code are only ever flagged, never archived.".to_string(),
+            (true, SpamChecker::Codex) => "Texts from numbers that aren't in your contacts, in conversations you've never replied to, are checked by OpenAI's GPT-6 Luna through the codex command. The number, the messages and any pictures are sent to OpenAI. Texts with a verification code are only ever flagged, never archived.".to_string(),
+            (false, c) => format!("Needs the {} command, which wasn't found on PATH or in ~/.local/bin.", c.command()),
         }));
         describe(&group, self.settings.borrow().spam_checker);
         let modes = gtk4::StringList::new(&["Off", "Flag likely spam", "Archive likely spam"]);
@@ -235,11 +255,12 @@ impl ChatsView {
         let checker = adw::ComboRow::builder().title("Checked by").model(&checkers)
             .subtitle("Uses the account that command is signed in to").build();
         checker.set_selected(match self.settings.borrow().spam_checker { SpamChecker::Claude => 0, SpamChecker::Codex => 1 });
-        let (me, g) = (self.clone(), group.clone());
+        // Weak: these rows live inside the group and the dialog, so strong refs would keep both alive.
+        let (me, g) = (self.clone(), group.downgrade());
         checker.connect_selected_notify(move |r| {
             let c = if r.selected() == 1 { SpamChecker::Codex } else { SpamChecker::Claude };
             { let mut s = me.settings.borrow_mut(); s.spam_checker = c; s.save(); }
-            describe(&g, c);
+            if let Some(g) = g.upgrade() { describe(&g, c); }
             // A newly picked command gets its own warning if it fails.
             me.spam.warned.set(false);
         });
@@ -249,8 +270,8 @@ impl ChatsView {
         context.connect_apply(move |e| { let mut s = me.settings.borrow_mut(); s.spam_context = e.text().to_string(); s.save(); });
         let review = adw::ActionRow::builder().title("Review decisions").activatable(true).build();
         review.add_suffix(&gtk4::Image::from_icon_name("go-next-symbolic"));
-        let (me, dlg) = (self.clone(), dialog.clone());
-        review.connect_activated(move |_| dlg.push_subpage(&me.spam_review()));
+        let (me, dlg) = (self.clone(), dialog.downgrade());
+        review.connect_activated(move |_| { if let Some(d) = dlg.upgrade() { d.push_subpage(&me.spam_review()); } });
         group.add(&mode); group.add(&checker); group.add(&context); group.add(&review);
         group
     }
@@ -267,7 +288,7 @@ impl ChatsView {
             let verdict = match e.judgement { Judgement::Spam => "Spam", Judgement::Unsure => "Unsure", Judgement::Legit => "Legit" };
             let when = super::fmt_time(e.date * 1_000_000);
             let row = adw::ActionRow::builder().title(&e.name).use_markup(false).subtitle_lines(4)
-                .subtitle(format!("{verdict} · {} · {when} — {}\n“{}”", checker_name(e.checker), e.reason, e.excerpt)).build();
+                .subtitle(format!("{verdict} · {} · {when} — {}\n“{}”", e.checker.label(), e.reason, e.excerpt)).build();
             let button = gtk4::Button::builder().valign(gtk4::Align::Center).build();
             let set = |b: &gtk4::Button, action: Action| match action {
                 Action::Archived => { b.set_label("Restore"); b.remove_css_class("destructive-action"); }
@@ -277,10 +298,16 @@ impl ChatsView {
             set(&button, e.action);
             let me = self.clone();
             let action = Rc::new(Cell::new(e.action));
+            // The label changes once the phone has done it; until then the button waits.
             button.connect_clicked(move |b| {
-                if action.get() == Action::Archived { me.allow(&e.conversation_id); action.set(Action::Allowed); }
-                else { me.archive_now(&e.conversation_id); action.set(Action::Archived); }
-                set(b, action.get());
+                b.set_sensitive(false);
+                let to = if action.get() == Action::Archived { Action::Allowed } else { Action::Archived };
+                let (b, action) = (b.downgrade(), action.clone());
+                let done = move |ok: bool| {
+                    if ok { action.set(to); }
+                    if let Some(b) = b.upgrade() { b.set_sensitive(true); set(&b, action.get()); }
+                };
+                if to == Action::Allowed { me.allow(&e.conversation_id, done); } else { me.archive_now(&e.conversation_id, done); }
             });
             row.add_suffix(&button);
             group.add(&row);

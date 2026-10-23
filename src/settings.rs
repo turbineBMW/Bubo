@@ -41,6 +41,13 @@ pub enum SpamChecker {
     Codex,
 }
 
+impl SpamChecker {
+    /// The command it runs.
+    pub fn command(self) -> &'static str { match self { Self::Claude => "claude", Self::Codex => "codex" } }
+    /// How the UI names it.
+    pub fn label(self) -> &'static str { match self { Self::Claude => "Claude", Self::Codex => "Codex" } }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {

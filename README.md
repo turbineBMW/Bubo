@@ -67,8 +67,8 @@ conversation. The number, the latest messages and up to three pictures go to a s
 Claude Haiku through `claude -p`, or OpenAI's GPT-6 Luna through `codex exec`. Pick which one
 under **Checked by**. The model answers spam, unsure or legit, and the notification waits for the
 answer. **Flag** labels likely spam in the notification. **Archive** marks the conversation read
-and archives it on the phone, with an Undo toast. Texts with a verification code are never sent
-to a model or archived. Every decision is listed under **Review decisions**. Restoring a
+and archives it on the phone, with an Undo toast. A conversation that looks like it has a verification
+code is only ever flagged, never archived. Every decision is listed under **Review decisions**. Restoring a
 conversation there brings it back to the inbox, and it's never screened again.
 
 The sender's text is untrusted, so the command runs with no tools, MCP servers, plugins or user

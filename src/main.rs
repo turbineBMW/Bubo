@@ -173,13 +173,14 @@ async fn cli_send(conv: String, text: String) -> anyhow::Result<()> {
 /// what the chosen model says, without acting on it.
 async fn cli_spam_check(conv: String) -> anyhow::Result<()> {
     let (client, _events) = connected().await?;
-    let Some(s) = spam::suspect(&client, &conv).await? else { println!("not screened: a group, a contact, or a conversation you've written in"); return Ok(()) };
+    let spam::Lookup::Suspect(s) = spam::suspect(&client, &conv, None).await? else { println!("not screened: a group, a contact, or a conversation you've written in"); return Ok(()) };
     let settings = settings::Settings::load();
     println!("{}", spam::describe(&settings.spam_context, &s));
     println!("({} picture{})", s.images.len(), if s.images.len() == 1 { "" } else { "s" });
-    let bin = spam::find(settings.spam_checker).ok_or_else(|| anyhow::anyhow!("{:?} isn't installed", settings.spam_checker))?;
+    let bin = spam::find(settings.spam_checker).ok_or_else(|| anyhow::anyhow!("`{}` isn't installed", settings.spam_checker.command()))?;
     let v = spam::classify(settings.spam_checker, &bin, &settings.spam_context, &s).await?;
-    println!("→ {:?} ({:?}): {}", v.judgement, settings.spam_checker, v.reason);
+    println!("→ {:?} ({}): {}", v.judgement, settings.spam_checker.label(), v.reason);
+    if s.has_code { println!("(it looks like it has a verification code, so it would be flagged, never archived)"); }
     Ok(())
 }
 
