@@ -606,6 +606,23 @@ impl Client {
         if !r.success { bail!("phone refused to delete the conversation") }
         Ok(())
     }
+    /// Move a conversation to the phone's archive, or back to the inbox. The phone follows up
+    /// with a `Conversation` event carrying the new status.
+    pub async fn set_archived(&self, conversation_id: &str, archived: bool) -> Result<()> {
+        let status = if archived { conversations::ConversationStatus::Archived } else { conversations::ConversationStatus::Active };
+        let req = UpdateConversationRequest {
+            action: ConversationActionStatus::UnknownActionStatus as i32,
+            conversation_id: conversation_id.into(),
+            action5: None,
+            data: Some(update_conversation_request::Data::UpdateData(UpdateConversationData {
+                conversation_id: conversation_id.into(),
+                data: Some(update_conversation_data::Data::Status(status as i32)),
+            })),
+        };
+        let r: UpdateConversationResponse = self.call(ActionType::UpdateConversation, req, true).await?;
+        if !r.success { bail!("phone refused to {} the conversation", if archived { "archive" } else { "unarchive" }) }
+        Ok(())
+    }
     /// React to a message: `Add` a first reaction, `Switch` ours to a different emoji, or
     /// `Remove` it. Everyone gets one reaction per message, as in the Messages app.
     pub async fn send_reaction(&self, message_id: &str, emoji: &str, action: send_reaction_request::Action) -> Result<()> {

@@ -1,4 +1,6 @@
 //! Conversation list + message thread + composer.
+mod spam;
+
 use super::state::{Conv, Media, Msg, Reaction, fmt_time};
 use crate::gm::client::Client;
 use crate::gm::events::Event;
@@ -83,6 +85,7 @@ pub struct ChatsView {
     new_chat: gtk4::Button,
     /// The phone's address book, fetched on first use of the picker and kept for the session.
     contacts: Rc<RefCell<Option<Rc<Vec<ContactEntry>>>>>,
+    spam: spam::Screen,
 }
 
 /// A file waiting in the composer tray until the next send.
@@ -255,7 +258,7 @@ impl ChatsView {
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
         let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), scroll_queued: Cell::new(false), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, spelling, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
-            pending_box, pending: RefCell::default(), settings, notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default() };
+            pending_box, pending: RefCell::default(), settings, notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default(), spam: spam::Screen::new() };
         v
     }
 
@@ -379,7 +382,11 @@ impl ChatsView {
         let me = self.clone();
         glib::spawn_future_local(async move {
             match rx.recv().await {
-                Ok(Ok(r)) => { for c in &r.conversations { me.upsert_conv(Conv::from_proto(c)); } me.rebuild_list(); me.fetch_avatars(); }
+                Ok(Ok(r)) => {
+                    for c in &r.conversations { me.upsert_conv(Conv::from_proto(c)); }
+                    me.rebuild_list(); me.fetch_avatars();
+                    for c in &r.conversations { me.screen_backlog(&c.conversation_id); }
+                }
                 Ok(Err(e)) => { me.rebuild_list(); me.toast.add_toast(adw::Toast::new(&format!("Could not load chats: {e:#}"))); }
                 Err(_) => {}
             }
@@ -389,7 +396,11 @@ impl ChatsView {
     fn handle(self: &Rc<Self>, ev: Event) {
         match ev {
             Event::Conversation(c) => { self.upsert_conv(Conv::from_proto(&c)); self.rebuild_list(); self.fetch_avatars(); }
-            Event::Message { msg, is_old } => { let m = Msg::from_proto(&msg); self.maybe_notify(&m, is_old); self.push_message(m, is_old); }
+            Event::Message { msg, is_old } => {
+                let m = Msg::from_proto(&msg);
+                if self.is_news(&m, is_old) && !self.screen_message(&m) { self.notify(&m, None); }
+                self.push_message(m, is_old);
+            }
             Event::PhoneNotResponding => { self.banner.set_title("Your phone isn't responding — is it online?"); self.banner.set_revealed(true); }
             Event::PhoneRespondingAgain | Event::Connected => self.banner.set_revealed(false),
             Event::ListenError(e) => { self.banner.set_title(&format!("Connection trouble: {e}")); self.banner.set_revealed(true); }
@@ -417,7 +428,7 @@ impl ChatsView {
     }
 
     fn upsert_conv(&self, c: Conv) {
-        if c.deleted { self.remove_conv(&c.id); return; }
+        if c.deleted || c.archived { self.remove_conv(&c.id); return; }
         let mut st = self.st.borrow_mut();
         match st.convs.iter_mut().find(|x| x.id == c.id) {
             Some(x) => { let n = if c.unread { x.unread_count } else { 0 }; *x = c; x.unread_count = n; }
@@ -1052,15 +1063,20 @@ impl ChatsView {
         });
     }
 
-    /// Desktop notification for an inbound message, unless it's ours, backfill, or the
-    /// conversation is already open in a focused window.
-    fn maybe_notify(self: &Rc<Self>, m: &Msg, is_old: bool) {
-        if is_old || m.from_me { return; }
+    /// Whether an inbound message is news: not ours, not backfill, and not an update to one we
+    /// already have.
+    fn is_news(&self, m: &Msg, is_old: bool) -> bool {
+        if is_old || m.from_me { return false; }
         // Status and reaction changes re-send the whole message; only its first sighting is news.
         // One we never loaded that already carries reactions is an old message being reacted to.
-        if self.knows(m) { return; }
+        if self.knows(m) { return false; }
         let age_us = glib::real_time() - m.ts;
-        if !m.reactions.is_empty() && age_us > 60_000_000 { return; }
+        m.reactions.is_empty() || age_us <= 60_000_000
+    }
+
+    /// Desktop notification for a message that `is_news`, unless the conversation is already
+    /// open in a focused window. `label` goes in front of the title.
+    fn notify(self: &Rc<Self>, m: &Msg, label: Option<&str>) {
         let st = self.st.borrow();
         let focused_here = self.win.is_active() && st.current.as_deref() == Some(&m.conversation_id);
         if focused_here { return; }
@@ -1077,6 +1093,7 @@ impl ChatsView {
         drop(st);
         let otp = crate::notify::detect_otp(&m.text);
         if let Some(code) = &otp { title = format!("{code} · {title}"); }
+        if let Some(label) = label { title = format!("{label} · {title}"); }
         let Some(n) = &self.notifier else { return };
         n.send(crate::notify::Notice { conversation_id: m.conversation_id.clone(), title, body, otp }, &self.settings.borrow().notification_sound);
     }
@@ -1324,6 +1341,7 @@ impl ChatsView {
         group.add(&sound_row); group.add(&file_row); group.add(&test);
         page.add(&group);
         page.add(&self.background_group(&dialog));
+        page.add(&self.spam_preferences(&dialog));
         dialog.add(&page);
         dialog.present(Some(&self.win));
     }

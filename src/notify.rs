@@ -130,6 +130,9 @@ fn copy_to_clipboard(text: &str) {
 /// message that also talks about a code. Long runs (phone numbers), and amounts, don't count.
 pub fn detect_otp(text: &str) -> Option<String> {
     const KEYWORDS: [&str; 10] = ["code", "otp", "verif", "passcode", "pin", "one-time", "one time", "single-use", "2fa", "password"];
+    // Links carry numbers and words like "refcode=2026-10" that aren't codes.
+    let text = text.split_whitespace().filter(|w| !(w.contains("://") || w.starts_with("www.") || w.contains('.') && w.contains('/'))).collect::<Vec<_>>().join(" ");
+    let text = text.as_str();
     let lower = text.to_lowercase();
     if !KEYWORDS.iter().any(|k| lower.contains(k)) { return None; }
     let b = text.as_bytes();
@@ -168,5 +171,8 @@ mod tests {
         assert_eq!(detect_otp("I only need 1 more gift from 30224 to hit my daily"), None);
         assert_eq!(detect_otp("Your code: call +1 519 222 0428"), None);
         assert_eq!(detect_otp("Your PIN is $1234"), None);
+        assert_eq!(detect_otp("Rush $1 before 9 PM: https://secure.actblue.com/donate/x?refcode=2026-10_V-S2&amounts=25,50"), None);
+        assert_eq!(detect_otp("Chip in: wnrd.co/code/482913 now"), None);
+        assert_eq!(detect_otp("Your code is\n482913").as_deref(), Some("482913"));
     }
 }

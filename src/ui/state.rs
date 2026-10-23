@@ -31,6 +31,9 @@ pub struct Reaction {
 }
 
 impl Msg {
+    /// A line the phone adds itself ("Texting with …", someone joined), shown as ours.
+    pub fn is_tombstone(&self) -> bool { self.status >= 200 }
+
     pub fn from_proto(m: &Message) -> Self {
         let (mut text, mut media) = (Vec::new(), Vec::new());
         for i in &m.message_info {
@@ -111,6 +114,8 @@ pub struct Conv {
     /// The phone reports deleted conversations as updates with `status = DELETED` rather than
     /// dropping them, so the list has to filter them out itself.
     pub deleted: bool,
+    /// Moved to the phone's archive, so not in the inbox Bubo lists.
+    pub archived: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +146,7 @@ impl Conv {
             latest_message_id: c.latest_message_id.clone(),
             is_rcs: c.r#type == 2,
             deleted: c.status == 3,
+            archived: matches!(c.status, 2 | 4),
             members: {
                 // `otherParticipants` is only filled for groups; 1:1 chats list everyone in `participants`,
                 // including hidden entries such as our own address-book card (not flagged `isMe`), so
