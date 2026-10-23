@@ -17,6 +17,37 @@ pub enum Sound {
     None,
 }
 
+/// What the spam filter does with texts from unknown numbers (see `crate::spam`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpamFilter {
+    /// Nothing is sent to a model.
+    #[default]
+    Off,
+    /// Likely spam still notifies, labelled as such.
+    Flag,
+    /// Likely spam is marked read and archived without a notification.
+    Archive,
+}
+
+/// Which command-line agent judges texts for the spam filter.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SpamChecker {
+    /// Claude Haiku through `claude -p`.
+    #[default]
+    Claude,
+    /// OpenAI's small model through `codex exec`.
+    Codex,
+}
+
+impl SpamChecker {
+    /// The command it runs.
+    pub fn command(self) -> &'static str { match self { Self::Claude => "claude", Self::Codex => "codex" } }
+    /// How the UI names it.
+    pub fn label(self) -> &'static str { match self { Self::Claude => "Claude", Self::Codex => "Codex" } }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -33,11 +64,16 @@ pub struct Settings {
     pub background_notice_shown: bool,
     /// The user's own KLIPY key for GIF search (see `gif`); empty until they add one.
     pub klipy_api_key: String,
+    pub spam_filter: SpamFilter,
+    pub spam_checker: SpamChecker,
+    /// Who might legitimately text out of the blue, told to the model so it lets them through.
+    pub spam_context: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true, run_in_background: false, start_at_login: false, background_notice_shown: false, klipy_api_key: String::new() }
+        Self { notification_sound: Sound::default(), follow_omarchy_theme: true, spell_check: true, run_in_background: false, start_at_login: false, background_notice_shown: false, klipy_api_key: String::new(),
+            spam_filter: SpamFilter::Off, spam_checker: SpamChecker::Claude, spam_context: String::new() }
     }
 }
 
@@ -76,10 +112,18 @@ mod tests {
         assert!(settings.follow_omarchy_theme);
         assert!(settings.spell_check);
         assert_eq!(settings.notification_sound, Sound::None);
+        assert_eq!(settings.spam_filter, SpamFilter::Off);
         let opted_out = Settings { follow_omarchy_theme: false, ..settings };
         let saved = serde_json::to_string(&opted_out).unwrap();
         let loaded: Settings = serde_json::from_str(&saved).unwrap();
         assert!(!loaded.follow_omarchy_theme);
         assert_eq!(loaded.notification_sound, Sound::None);
+    }
+
+    #[test]
+    fn spam_filter_choices_round_trip() {
+        let s: Settings = serde_json::from_str(r#"{"spam_filter":"archive","spam_checker":"codex"}"#).unwrap();
+        assert_eq!((s.spam_filter, s.spam_checker), (SpamFilter::Archive, SpamChecker::Codex));
+        assert!(serde_json::to_string(&s).unwrap().contains(r#""spam_filter":"archive","spam_checker":"codex""#));
     }
 }

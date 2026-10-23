@@ -35,6 +35,7 @@ cargo run -- pair            # legacy QR pairing in the terminal
 cargo run -- probe           # list conversations, then tail live events
 cargo run -- probe CONV_ID   # dump recent messages of one conversation
 cargo run -- send CONV_ID hello there
+cargo run -- spam-check CONV_ID   # what the spam filter would send about a conversation, and the verdict
 cargo run -- unpair
 RUST_LOG=bubo=debug cargo run -- probe   # see every RPC
 ```
@@ -56,6 +57,27 @@ Omarchy, Bubo uses the system appearance automatically.
 Like Rustle, Bubo reads `~/.local/state/omarchy/current/theme/colors.toml`.
 A theme can provide `bubo.css` to replace the generated colors, including through
 an Omarchy template at `~/.config/omarchy/themed/bubo.css.tpl`.
+
+## Spam filter
+
+**Preferences → Spam filter** screens texts from unknown numbers, such as political campaign
+texts that come from a new number every time. A text is screened when it's in a one-to-one
+conversation with a number that isn't in the phone's contacts, and you've never written in that
+conversation. The number, the latest messages and up to three pictures go to a small model:
+Claude Haiku through `claude -p`, or OpenAI's GPT-6 Luna through `codex exec`. Pick which one
+under **Checked by**. The model answers spam, unsure or legit, and the notification waits for the
+answer. **Flag** labels likely spam in the notification. **Archive** marks the conversation read
+and archives it on the phone, with an Undo toast. A conversation that looks like it has a verification
+code is only ever flagged, never archived. Every decision is listed under **Review decisions**. Restoring a
+conversation there brings it back to the inbox, and it's never screened again.
+
+The sender's text is untrusted, so the command runs with no tools, MCP servers, plugins or user
+settings, in an empty directory (`~/.cache/bubo/spam-check`), and only its schema-checked
+verdict is read back. Fill in **Who might text you out of the blue** (for example "crew leads
+texting about job sites") so genuine cold texts get through. The filter needs Claude Code or
+Codex installed and signed in, and uses that account. The log is kept in
+`~/.local/share/bubo/spam-log.json`. `cargo test -- --ignored live_c` checks the prompt
+against both real models.
 
 ## How the protocol works
 
@@ -96,6 +118,7 @@ Google-account (emoji) pairing and message sync verified live end-to-end 2026-08
 - [x] Desktop notifications (click to open the conversation)
 - [x] Media: view inbound images inline, download files, send images/files (AES-GCM chunked)
 - [x] Spell checking in the composer (Preferences → Composing, or the composer's right-click menu)
+- [x] Spam filter for unknown numbers (Claude or Codex): flag, or mark read and archive, with review and undo
 - [ ] Reactions, replies, contacts / new conversation UI
 
 ## Licence

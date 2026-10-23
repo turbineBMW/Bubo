@@ -6,6 +6,7 @@ mod notify;
 mod omarchy;
 mod settings;
 mod rt;
+mod spam;
 mod ui;
 
 use adw::prelude::*;
@@ -22,6 +23,7 @@ fn main() -> anyhow::Result<()> {
         Some("probe") => return rt::block_on(cli_probe(args.get(2).cloned())),
         Some("send") => return rt::block_on(cli_send(args.get(2).cloned().unwrap_or_default(), args[3..].join(" "))),
         Some("unpair") => return rt::block_on(cli_unpair()),
+        Some("spam-check") => return rt::block_on(cli_spam_check(args.get(2).cloned().ok_or_else(|| anyhow::anyhow!("usage: bubo spam-check CONV_ID"))?)),
         _ => {}
     }
     // Unique: a second launch (the launcher, while Bubo runs hidden) raises the running window
@@ -164,6 +166,21 @@ async fn cli_send(conv: String, text: String) -> anyhow::Result<()> {
     let c = client.get_conversation(&conv).await?.ok_or_else(|| anyhow::anyhow!("no such conversation"))?;
     let r = client.send_text(&conv, &c.default_outgoing_id, &text, None).await?;
     println!("status: {:?}", gm::proto::client::send_message_response::Status::try_from(r.status));
+    Ok(())
+}
+
+/// `bubo spam-check CONV_ID` — show what the spam filter would send about a conversation and
+/// what the chosen model says, without acting on it.
+async fn cli_spam_check(conv: String) -> anyhow::Result<()> {
+    let (client, _events) = connected().await?;
+    let spam::Lookup::Suspect(s) = spam::suspect(&client, &conv, None).await? else { println!("not screened: a group, a contact, or a conversation you've written in"); return Ok(()) };
+    let settings = settings::Settings::load();
+    println!("{}", spam::describe(&settings.spam_context, &s));
+    println!("({} picture{})", s.images.len(), if s.images.len() == 1 { "" } else { "s" });
+    let bin = spam::find(settings.spam_checker).ok_or_else(|| anyhow::anyhow!("`{}` isn't installed", settings.spam_checker.command()))?;
+    let v = spam::classify(settings.spam_checker, &bin, &settings.spam_context, &s).await?;
+    println!("→ {:?} ({}): {}", v.judgement, settings.spam_checker.label(), v.reason);
+    if s.has_code { println!("(it looks like it has a verification code, so it would be flagged, never archived)"); }
     Ok(())
 }
 

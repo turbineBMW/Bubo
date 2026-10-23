@@ -2,7 +2,7 @@
 //! and reports back through an async-channel drained by a glib-local future.
 mod chats;
 mod login;
-mod state;
+pub(crate) mod state;
 
 use crate::gm;
 use adw::prelude::*;
