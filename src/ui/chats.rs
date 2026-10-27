@@ -766,8 +766,7 @@ impl ChatsView {
         let me = self.clone();
         glib::spawn_future_local(async move {
             match rx.recv().await {
-                Ok(Ok(r)) if r.status == 1 => {}
-                Ok(Ok(r)) => me.toast.add_toast(adw::Toast::new(&format!("Phone rejected the message (status {})", r.status))),
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => me.toast.add_toast(adw::Toast::new(&format!("Send failed: {e:#}"))),
                 Err(_) => {}
             }
@@ -877,7 +876,7 @@ impl ChatsView {
         btn.upcast()
     }
 
-    /// Download a GIF, upload it, and send it (with any composer text as caption). Once sent, it
+    /// Download a GIF, upload it, and send it (with any composer text after it). Once sent, it
     /// joins the picker's history.
     fn send_gif(self: &Rc<Self>, gif: crate::gif::Gif) {
         let conv = { let st = self.st.borrow(); st.current.as_ref().and_then(|id| st.convs.iter().find(|c| &c.id == id).cloned()) };
@@ -890,7 +889,7 @@ impl ChatsView {
             let r = async {
                 let data = crate::gif::download(&url).await?;
                 let media = c.upload_media(&data, "animation.gif", "image/gif").await?;
-                c.send_media(&cid, &pid, media, &caption, None).await.map(|_| ())
+                c.send_media(&cid, &pid, media, &caption, None).await
             }.await;
             let _ = tx.send(r).await;
         });
@@ -999,8 +998,8 @@ impl ChatsView {
         Some(gtk4::gdk::Texture::for_pixbuf(&scaled))
     }
 
-    /// Upload and send everything in the tray, in order; the composer text rides as the caption
-    /// on the last one so it lands beneath the pictures.
+    /// Upload and send everything in the tray, in order; the composer text follows the last one
+    /// as its own message so it lands beneath the pictures.
     fn send_pending(self: &Rc<Self>, conv: Conv, text: String) {
         let items: Vec<(Vec<u8>, String, String)> = self.pending.borrow_mut().drain(..).map(|p| {
             self.pending_box.remove(&p.tile);
@@ -1046,7 +1045,7 @@ impl ChatsView {
             let (c, cid, pid, caption) = (me.client.clone(), conv.id.clone(), conv.default_outgoing_id.clone(), me.entry_text());
             crate::rt::spawn(async move {
                 let r = match c.upload_media(&data, &name, &mime).await {
-                    Ok(media) => c.send_media(&cid, &pid, media, &caption, None).await.map(|_| ()),
+                    Ok(media) => c.send_media(&cid, &pid, media, &caption, None).await,
                     Err(e) => Err(e),
                 };
                 let _ = tx.send(r).await;

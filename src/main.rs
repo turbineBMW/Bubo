@@ -164,8 +164,8 @@ async fn cli_probe(conv: Option<String>) -> anyhow::Result<()> {
 async fn cli_send(conv: String, text: String) -> anyhow::Result<()> {
     let (client, _events) = connected().await?;
     let c = client.get_conversation(&conv).await?.ok_or_else(|| anyhow::anyhow!("no such conversation"))?;
-    let r = client.send_text(&conv, &c.default_outgoing_id, &text, None).await?;
-    println!("status: {:?}", gm::proto::client::send_message_response::Status::try_from(r.status));
+    client.send_text(&conv, &c.default_outgoing_id, &text, None).await?;
+    println!("sent");
     Ok(())
 }
 
