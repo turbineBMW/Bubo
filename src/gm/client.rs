@@ -494,7 +494,7 @@ impl Client {
     pub async fn list_messages(&self, conversation_id: &str, count: i64, cursor: Option<Cursor>) -> Result<ListMessagesResponse> {
         self.call(ActionType::ListMessages, ListMessagesRequest { conversation_id: conversation_id.into(), count, cursor }, false).await
     }
-    pub async fn send_text(&self, conversation_id: &str, participant_id: &str, text: &str, sim: Option<settings::SimPayload>) -> Result<SendMessageResponse> {
+    pub async fn send_text(&self, conversation_id: &str, participant_id: &str, text: &str, sim: Option<settings::SimPayload>) -> Result<()> {
         let tmp = uuid::Uuid::new_v4().to_string();
         let req = SendMessageRequest {
             conversation_id: conversation_id.into(),
@@ -505,21 +505,22 @@ impl Client {
             }),
             sim_payload: sim, tmp_id: tmp, force_rcs: false, reply: None,
         };
-        self.call(ActionType::SendMessage, req, true).await
+        accepted(self.call(ActionType::SendMessage, req, true).await?)
     }
-    /// Send an already-uploaded attachment (optionally with a caption) to a conversation.
-    pub async fn send_media(&self, conversation_id: &str, participant_id: &str, media: conversations::MediaContent, caption: &str, sim: Option<settings::SimPayload>) -> Result<SendMessageResponse> {
+    /// Send an already-uploaded attachment, then the caption (if any) as a text message of its own.
+    /// The phone won't take both in one message: it keeps the text, drops the attachment and leaves
+    /// the message at "yet to send", which also holds up everything sent after it.
+    pub async fn send_media(&self, conversation_id: &str, participant_id: &str, media: conversations::MediaContent, caption: &str, sim: Option<settings::SimPayload>) -> Result<()> {
         let tmp = uuid::Uuid::new_v4().to_string();
-        let mut info = vec![conversations::MessageInfo { action_message_id: None, data: Some(conversations::message_info::Data::MediaContent(media)) }];
-        if !caption.is_empty() {
-            info.push(conversations::MessageInfo { action_message_id: None, data: Some(conversations::message_info::Data::MessageContent(conversations::MessageContent { content: caption.into() })) });
-        }
+        let info = vec![conversations::MessageInfo { action_message_id: None, data: Some(conversations::message_info::Data::MediaContent(media)) }];
         let req = SendMessageRequest {
             conversation_id: conversation_id.into(),
             message_payload: Some(MessagePayload { tmp_id: tmp.clone(), conversation_id: conversation_id.into(), participant_id: participant_id.into(), tmp_id2: tmp.clone(), message_payload_content: None, message_info: info }),
-            sim_payload: sim, tmp_id: tmp, force_rcs: false, reply: None,
+            sim_payload: sim.clone(), tmp_id: tmp, force_rcs: false, reply: None,
         };
-        self.call(ActionType::SendMessage, req, true).await
+        accepted(self.call(ActionType::SendMessage, req, true).await?)?;
+        if caption.trim().is_empty() { return Ok(()); }
+        self.send_text(conversation_id, participant_id, caption, sim).await.context("sent the attachment, but not its text")
     }
 
     pub async fn mark_read(&self, conversation_id: &str, message_id: &str) -> Result<()> {
@@ -692,6 +693,11 @@ mod reaction_tests {
         assert_eq!(reaction_data("🦉").unicode, "🦉");
         assert_eq!(reaction_emoji(&conversations::ReactionData { unicode: String::new(), r#type: T::Laugh as i32, custom_emoji: None }), "😂");
     }
+}
+
+/// The phone answers non-success when it won't send a message; make that an error.
+fn accepted(r: SendMessageResponse) -> Result<()> {
+    if r.status == send_message_response::Status::Success as i32 { Ok(()) } else { bail!("phone rejected the message (status {})", r.status) }
 }
 
 /// Best-effort MediaFormats for a MIME type (covers the common cases; unknowns → *_UNSPECIFIED).
