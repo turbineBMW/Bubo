@@ -229,6 +229,7 @@ impl ChatsView {
             .bubo-me { background: var(--accent-bg-color); color: var(--accent-fg-color); }
             .bubo-them { background: alpha(currentColor, 0.08); }
             .bubo-image { border-radius: 16px; }
+            .bubo-viewer { background: black; }
             .bubo-entry-frame { border-radius: 18px; border: 1px solid color-mix(in srgb, currentColor var(--border-opacity), transparent); background: alpha(currentColor, 0.05); }
             .bubo-entry-frame:focus-within { border-color: var(--accent-bg-color); }
             .bubo-entry, .bubo-entry text { background: transparent; }
@@ -1685,12 +1686,18 @@ impl ChatsView {
 
     /// Bare image, scaled to fit within 360x480 (small thumbnails are scaled up), rounded corners.
     /// GIFs animate: frames are pulled from a PixbufAnimation on a timer for as long as the widget lives.
+    /// Clicking it opens the image fullscreen.
     fn image_picture(bytes: &[u8]) -> anyhow::Result<gtk4::Picture> {
         let pic = gtk4::Picture::new();
         pic.set_content_fit(gtk4::ContentFit::Fill);
         pic.set_can_shrink(true);
         pic.set_overflow(gtk4::Overflow::Hidden);
         pic.add_css_class("bubo-image");
+        pic.set_cursor_from_name(Some("zoom-in"));
+        let click = gtk4::GestureClick::builder().button(gtk4::gdk::BUTTON_PRIMARY).build();
+        let full = glib::Bytes::from(bytes);
+        click.connect_released(move |g, _, _, _| { if let Some(w) = g.widget() { Self::show_fullscreen(&w, &full); } });
+        pic.add_controller(click);
         let fit = |pic: &gtk4::Picture, w: i32, h: i32| {
             let (w, h) = (w.max(1) as f64, h.max(1) as f64);
             let k = (360.0 / w).min(480.0 / h);
@@ -1705,6 +1712,38 @@ impl ChatsView {
             pic.set_paintable(Some(&tex));
         }
         Ok(pic)
+    }
+
+    /// Show an image fullscreen on black, scaled to fit the screen. A click anywhere or Escape closes it.
+    fn show_fullscreen(from: &gtk4::Widget, bytes: &glib::Bytes) {
+        let pic = gtk4::Picture::builder().content_fit(gtk4::ContentFit::Contain).can_shrink(true).hexpand(true).vexpand(true).build();
+        if bytes.starts_with(b"GIF8") {
+            if let Err(e) = Self::play_gif(&pic, bytes) { tracing::warn!("could not show GIF: {e}"); return; }
+        } else {
+            match gtk4::gdk::Texture::from_bytes(bytes) {
+                Ok(tex) => pic.set_paintable(Some(&tex)),
+                Err(e) => { tracing::warn!("could not show image: {e}"); return; }
+            }
+        }
+        let win = gtk4::Window::builder().decorated(false).modal(true).css_classes(["bubo-viewer"]).child(&pic).build();
+        if let Some(parent) = from.root().and_downcast::<gtk4::Window>() {
+            win.set_transient_for(Some(&parent));
+            win.set_application(parent.application().as_ref());
+        }
+        let click = gtk4::GestureClick::new();
+        let w = win.downgrade();
+        click.connect_released(move |_, _, _, _| { if let Some(w) = w.upgrade() { w.close(); } });
+        win.add_controller(click);
+        let keys = gtk4::EventControllerKey::new();
+        let w = win.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk4::gdk::Key::Escape { return glib::Propagation::Proceed; }
+            if let Some(w) = w.upgrade() { w.close(); }
+            glib::Propagation::Stop
+        });
+        win.add_controller(keys);
+        win.fullscreen();
+        win.present();
     }
 
     /// Show a GIF on `pic` and animate it for as long as the picture lives: frames are pulled from
