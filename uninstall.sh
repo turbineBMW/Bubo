@@ -46,7 +46,8 @@ rm -f "$SHARE/applications/$APP_ID.desktop"
 for n in 16 32 48 64 128 256 512; do
   rm -f "$SHARE/icons/hicolor/${n}x${n}/apps/$APP_ID.png"
 done
-gtk4-update-icon-cache -q "$SHARE/icons/hicolor" 2>/dev/null || true
+rm -f "$SHARE/icons/hicolor/scalable/apps/$APP_ID.svg"
+gtk4-update-icon-cache -q -t -f "$SHARE/icons/hicolor" 2>/dev/null || true
 update-desktop-database "$SHARE/applications" 2>/dev/null || true
 
 if $purge; then
