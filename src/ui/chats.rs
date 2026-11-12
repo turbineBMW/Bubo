@@ -581,7 +581,9 @@ impl ChatsView {
         self.widget.set_show_content(true);
         self.composer.set_visible(true);
         self.entry.grab_focus();
-        let loaded = self.st.borrow().messages.contains_key(id);
+        // Push events can populate `messages` before this conversation is ever opened.
+        // Only a cursor entry proves that its initial history fetch has completed.
+        let loaded = self.st.borrow().cursors.contains_key(id);
         if loaded { self.render_thread(ScrollTarget::Bottom); } else {
             while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
             self.content_stack.set_visible_child_name("loading");
@@ -592,10 +594,20 @@ impl ChatsView {
             glib::spawn_future_local(async move {
                 match rx.recv().await {
                     Ok(Ok(r)) => {
-                        let mut msgs: Vec<Msg> = r.messages.iter().map(Msg::from_proto).collect();
-                        msgs.sort_by_key(|m| m.ts);
                         let more = (r.messages.len() as i64) >= PAGE;
-                        { let mut st = me.st.borrow_mut(); st.messages.insert(id2.clone(), msgs); st.cursors.insert(id2.clone(), r.cursor.filter(|_| more)); }
+                        {
+                            let mut st = me.st.borrow_mut();
+                            // Preserve live messages (and status/reaction updates) received before
+                            // or during the fetch rather than replacing the event cache outright.
+                            let msgs = st.messages.entry(id2.clone()).or_default();
+                            for m in r.messages.iter().map(Msg::from_proto) {
+                                if !msgs.iter().any(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) {
+                                    msgs.push(m);
+                                }
+                            }
+                            msgs.sort_by_key(|m| m.ts);
+                            st.cursors.insert(id2.clone(), r.cursor.filter(|_| more));
+                        }
                         if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(ScrollTarget::Bottom); }
                     }
                     Ok(Err(e)) => {
