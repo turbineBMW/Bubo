@@ -76,6 +76,14 @@ impl Theme {
             .flatten();
         self.provider
             .load_from_string(palette.as_ref().map_or("", |theme| theme.css.as_str()));
+        // Only a theme's own bubo.css can lower the sidebar's opacity; this
+        // provider outranks the built-in default of 1.
+        crate::sidebar::set_opacity(
+            palette
+                .as_ref()
+                .and_then(|theme| crate::sidebar::opacity_in(&theme.css))
+                .unwrap_or(1.0),
+        );
         adw::StyleManager::default().set_color_scheme(match palette {
             Some(theme) if theme.light => adw::ColorScheme::ForceLight,
             Some(_) => adw::ColorScheme::ForceDark,
