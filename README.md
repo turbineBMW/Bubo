@@ -55,8 +55,18 @@ or dark mode. Desktop theme changes apply live. Turn off **Preferences → Appea
 Omarchy, Bubo uses the system appearance automatically.
 
 Like Rustle, Bubo reads `~/.local/state/omarchy/current/theme/colors.toml`.
-A theme can provide `bubo.css` to replace the generated colors, including through
-an Omarchy template at `~/.config/omarchy/themed/bubo.css.tpl`.
+A theme can provide `bubo.css`, including through an Omarchy template at
+`~/.config/omarchy/themed/bubo.css.tpl`. It's layered over the generated colors,
+so it only needs the variables it changes.
+
+For a see-through conversation list, set `--bubo-sidebar-opacity` to a number from
+0 to 1. It fades only the sidebar's background, not its text, and the open
+conversation stays opaque. For example, for every theme:
+
+```css
+/* ~/.config/omarchy/themed/bubo.css.tpl */
+:root { --bubo-sidebar-opacity: 0.8; }
+```
 
 ## Spam filter
 

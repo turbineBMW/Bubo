@@ -6,6 +6,7 @@ mod notify;
 mod omarchy;
 mod settings;
 mod rt;
+mod sidebar;
 mod spam;
 mod ui;
 
@@ -41,6 +42,7 @@ fn main() -> anyhow::Result<()> {
     app.connect_startup(|app| {
         if let Some(display) = gtk4::gdk::Display::default() {
             accent::install_fallback(&display);
+            sidebar::install(&display);
             omarchy::install(&display);
         }
         // With "Run in background" on, closing the window no longer quits.

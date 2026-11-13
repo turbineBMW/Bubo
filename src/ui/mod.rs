@@ -12,8 +12,10 @@ use std::rc::Rc;
 /// `hidden`: started at login. Stay out of sight unless there is pairing to do, which needs the user.
 pub fn build(app: &adw::Application, hidden: bool) {
     let win = adw::ApplicationWindow::builder().application(app).title("Bubo").default_width(1000).default_height(700).build();
-    let stack = gtk4::Stack::builder().transition_type(gtk4::StackTransitionType::Crossfade).build();
+    // `bubo-root`: its pages are repainted when a translucent sidebar clears the window background.
+    let stack = gtk4::Stack::builder().transition_type(gtk4::StackTransitionType::Crossfade).css_classes(["bubo-root"]).build();
     win.set_content(Some(&stack));
+    crate::sidebar::sync(&win);
     {
         let stack = stack.clone();
         win.connect_close_request(move |win| {
