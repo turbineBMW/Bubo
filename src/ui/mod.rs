@@ -210,6 +210,14 @@ fn show_chats(win: &adw::ApplicationWindow, stack: &gtk4::Stack, client: std::sy
     let view = Rc::new(chats::ChatsView::new(win, client.clone(), events));
     stack.add_named(&view.widget, Some("chats"));
     stack.set_visible_child_name("chats");
+    // In a narrow window (a tablet in portrait, a tiled column) the chat list and the conversation
+    // become two pages of one navigation view: opening a chat pushes the conversation, and its back
+    // button, Alt+Left or a back gesture returns to the list. A window with breakpoints no longer
+    // takes its minimum size from its content, hence the size request.
+    win.set_size_request(360, 300);
+    let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(adw::BreakpointConditionLengthType::MaxWidth, 700.0, adw::LengthUnit::Sp));
+    narrow.add_setter(&view.widget, "collapsed", Some(&true.to_value()));
+    win.add_breakpoint(narrow);
     {
         let (win, stack) = (win.clone(), stack.clone());
         let client = client.clone();
