@@ -13,7 +13,8 @@
 //! `~/.config/omarchy/themed/bubo.css.tpl` template. It is appended after
 //! everything derived here, so whatever it states wins and whatever it leaves
 //! out keeps the palette's value: a file can restate every colour, or carry a
-//! single line such as `:root { --bubo-sidebar-opacity: 0.8; }`.
+//! single line such as `:root { --accent-bg-color: #e8894a; }`. (The
+//! sidebar's opacity is no longer the theme's to set; see `sidebar`.)
 //!
 //! The resolution cascade below mirrors `omarchy-theme-color` so Bubo and
 //! the rest of the desktop read an identical palette out of the same file,
