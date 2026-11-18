@@ -1,33 +1,30 @@
 //! A see-through conversation list.
 //!
-//! `--bubo-sidebar-opacity`, a number from 0 to 1, fades the sidebar's
-//! background but never its text. It defaults to 1 here, and an Omarchy
-//! theme's `bubo.css` (see `omarchy::palette`) can lower it with a one-line
-//! `:root { --bubo-sidebar-opacity: 0.8; }`.
+//! **Preferences → Appearance → Transparent sidebar** fades the sidebar's
+//! background, never its text, to the opacity of the slider below it. Both
+//! live in Bubo's own settings (`transparent_sidebar`, `sidebar_opacity`), not
+//! in the Omarchy theme: the value is stated in a provider above the theme's,
+//! so a theme's `bubo.css` can no longer change it. Before this setting
+//! existed a theme set `--bubo-sidebar-opacity`; [`opacity_in`] still reads
+//! that once, so the first launch keeps the look (see `settings`).
 //!
 //! A faded sidebar over the window's own background would only blend into
 //! that colour, so below 1 the main window gets the `bubo-transparent` class,
 //! which clears the window background so the desktop shows through. Everything
 //! else that was painted by that background is painted again here, so only the
-//! sidebar turns translucent. GTK has no API to read a custom property back,
-//! so the opacity that decides the class is worked out from the CSS text by
-//! [`opacity_in`] whenever the theme reloads.
+//! sidebar turns translucent.
 use adw::prelude::*;
 use gtk4::{self as gtk, gio};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-/// The custom property a theme sets.
+/// The custom property the stylesheet reads.
 pub const OPACITY: &str = "--bubo-sidebar-opacity";
 
-/// Below the Omarchy provider (`APPLICATION + 2`), so a theme's value wins
-/// over the default of 1.
-///
 /// Side by side, the split view wraps its pages in a `.sidebar-pane` and a
 /// `.content-pane`; collapsed to one column, it moves both pages into a
 /// navigation view instead, where neither is a sidebar and both stay opaque.
 /// `.bubo-root` is the window's top-level stack (see `ui::build`).
-const CSS: &str = "
-:root { --bubo-sidebar-opacity: 1; }
+const RULES: &str = "
 /* Only the background fades, never the text. Scoped to the split view's own
    pane: libadwaita paints nested sidebar panes differently. */
 navigation-split-view > .sidebar-pane {
@@ -50,27 +47,50 @@ window.bubo-transparent navigation-split-view > navigation-view > navigation-vie
 }
 ";
 
+/// The whole stylesheet at `opacity`.
+fn css(opacity: f32) -> String {
+    format!(":root {{ {OPACITY}: {opacity:.2}; }}\n{RULES}")
+}
+
 const TRANSPARENT: &str = "bubo-transparent";
 
 thread_local! {
-    /// The opacity the cascade currently resolves to.
+    static PROVIDER: RefCell<Option<gtk::CssProvider>> = const { RefCell::new(None) };
+    /// The opacity now in force: 1 while the setting is off.
     static CURRENT: Cell<f32> = const { Cell::new(1.0) };
 }
 
-/// Install once during application startup, before the Omarchy theme.
+/// Install once during application startup. Above the Omarchy provider
+/// (`APPLICATION + 2`), so the setting wins over anything a theme states.
 pub fn install(display: &gtk::gdk::Display) {
     let provider = gtk::CssProvider::new();
-    provider.load_from_string(CSS);
     gtk::style_context_add_provider_for_display(
         display,
         &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
     );
+    PROVIDER.with(|cell| cell.replace(Some(provider)));
+    apply();
 }
 
-/// Record the opacity now in force and bring the main window in line.
-pub fn set_opacity(opacity: f32) {
-    CURRENT.with(|current| current.set(opacity));
+/// The opacity the settings ask for: 1 when the sidebar isn't transparent.
+pub fn opacity(transparent: bool, opacity: f32) -> f32 {
+    if transparent { opacity.clamp(0.0, 1.0) } else { 1.0 }
+}
+
+/// Bring the stylesheet and the main window in line with the settings.
+pub fn apply() {
+    let current = {
+        let settings = crate::settings::shared();
+        let settings = settings.borrow();
+        opacity(settings.transparent_sidebar, settings.sidebar_opacity)
+    };
+    CURRENT.with(|cell| cell.set(current));
+    PROVIDER.with(|cell| {
+        if let Some(provider) = cell.borrow().as_ref() {
+            provider.load_from_string(&css(current));
+        }
+    });
     let Some(app) = gio::Application::default().and_downcast::<gtk::Application>() else {
         return;
     };
@@ -192,11 +212,14 @@ mod tests {
         );
     }
 
-    /// The default the built-in stylesheet states is the one assumed when a
-    /// theme states none.
+    /// The stylesheet states the opacity it was built for, and the setting
+    /// only takes effect while the switch is on.
     #[test]
-    fn the_built_in_default_is_opaque() {
-        assert_eq!(opacity_in(CSS), Some(1.0));
+    fn the_stylesheet_states_the_setting() {
+        assert_eq!(opacity_in(&css(0.8)), Some(0.8));
+        assert_eq!(opacity(true, 0.8), 0.8);
+        assert_eq!(opacity(false, 0.3), 1.0);
+        assert_eq!(opacity(true, 1.5), 1.0);
     }
 
     /// The stylesheet parses, and the split view names its panes the way it
@@ -211,7 +234,7 @@ mod tests {
         provider.connect_parsing_error(move |_, _, error| {
             errors_clone.borrow_mut().push(error.to_string());
         });
-        provider.load_from_string(CSS);
+        provider.load_from_string(&css(0.8));
         assert!(
             errors.borrow().is_empty(),
             "CSS errors: {:?}",

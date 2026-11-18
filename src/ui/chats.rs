@@ -1292,7 +1292,41 @@ impl ChatsView {
             crate::omarchy::set_follow(row.is_active());
         });
         appearance.add(&follow);
-        appearance.set_visible(crate::omarchy::detected());
+        // Outside Omarchy there is no theme to follow, but the sidebar setting still applies.
+        follow.set_visible(crate::omarchy::detected());
+        let transparent = adw::SwitchRow::builder().title("Transparent sidebar")
+            .subtitle("Show the desktop behind the conversation list")
+            .active(self.settings.borrow().transparent_sidebar).build();
+        let opacity_row = adw::ActionRow::builder().title("Sidebar opacity").build();
+        let scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, 0.0, 1.0, 0.05);
+        scale.set_value(self.settings.borrow().sidebar_opacity as f64);
+        scale.set_draw_value(true);
+        scale.set_value_pos(gtk4::PositionType::Left);
+        scale.set_hexpand(true);
+        scale.set_width_request(160);
+        scale.set_valign(gtk4::Align::Center);
+        scale.set_format_value_func(|_, value| format!("{}%", (value * 100.0).round()));
+        opacity_row.add_suffix(&scale);
+        opacity_row.set_activatable_widget(Some(&scale));
+        transparent.bind_property("active", &opacity_row, "sensitive").sync_create().build();
+        let me = self.clone();
+        transparent.connect_active_notify(move |row| {
+            let mut settings = me.settings.borrow_mut();
+            settings.transparent_sidebar = row.is_active();
+            settings.save();
+            drop(settings);
+            crate::sidebar::apply();
+        });
+        let me = self.clone();
+        scale.connect_value_changed(move |scale| {
+            let mut settings = me.settings.borrow_mut();
+            settings.sidebar_opacity = ((scale.value() * 100.0).round() / 100.0) as f32;
+            settings.save();
+            drop(settings);
+            crate::sidebar::apply();
+        });
+        appearance.add(&transparent);
+        appearance.add(&opacity_row);
         page.add(&appearance);
         let composing = adw::PreferencesGroup::builder().title("Composing").build();
         let spell = adw::SwitchRow::builder().title("Check spelling").subtitle("Underline misspelled words while typing")

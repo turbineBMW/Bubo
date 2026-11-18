@@ -59,14 +59,12 @@ A theme can provide `bubo.css`, including through an Omarchy template at
 `~/.config/omarchy/themed/bubo.css.tpl`. It's layered over the generated colors,
 so it only needs the variables it changes.
 
-For a see-through conversation list, set `--bubo-sidebar-opacity` to a number from
-0 to 1. It fades only the sidebar's background, not its text, and the open
-conversation stays opaque. For example, for every theme:
-
-```css
-/* ~/.config/omarchy/themed/bubo.css.tpl */
-:root { --bubo-sidebar-opacity: 0.8; }
-```
+For a see-through conversation list, turn on **Preferences → Appearance →
+Transparent sidebar** and pick how opaque it is with **Sidebar opacity**. It fades
+only the sidebar's background, not its text, and the open conversation stays
+opaque. The setting is Bubo's own, so it works without Omarchy and no theme can
+change it. (A theme's `--bubo-sidebar-opacity` used to set this; the first launch
+of this version carries that value over into the setting.)
 
 ## Spam filter
 

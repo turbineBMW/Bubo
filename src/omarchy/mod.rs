@@ -58,6 +58,13 @@ pub fn install(display: &gtk::gdk::Display) {
     });
 }
 
+/// What the active theme's own `bubo.css` set `--bubo-sidebar-opacity` to, back when the theme
+/// decided it. Only read once, to carry it into the settings (see `settings`).
+pub fn legacy_sidebar_opacity() -> Option<f32> {
+    let css = std::fs::read_to_string(palette::theme_dir(&glib::home_dir()).join("bubo.css")).ok()?;
+    crate::sidebar::opacity_in(&css)
+}
+
 pub fn set_follow(enabled: bool) {
     THEME.with(|cell| {
         if let Some(theme) = cell.borrow().as_ref() {
@@ -76,14 +83,6 @@ impl Theme {
             .flatten();
         self.provider
             .load_from_string(palette.as_ref().map_or("", |theme| theme.css.as_str()));
-        // Only a theme's own bubo.css can lower the sidebar's opacity; this
-        // provider outranks the built-in default of 1.
-        crate::sidebar::set_opacity(
-            palette
-                .as_ref()
-                .and_then(|theme| crate::sidebar::opacity_in(&theme.css))
-                .unwrap_or(1.0),
-        );
         adw::StyleManager::default().set_color_scheme(match palette {
             Some(theme) if theme.light => adw::ColorScheme::ForceLight,
             Some(_) => adw::ColorScheme::ForceDark,
