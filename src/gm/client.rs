@@ -3,6 +3,7 @@ use crate::gm::auth::{AuthData, QR_NETWORK};
 use crate::gm::proto::config::Config;
 use crate::gm::events::Event;
 use crate::gm::http;
+use crate::gm::ids;
 use crate::gm::proto::authentication::*;
 use crate::gm::proto::client::*;
 use crate::gm::proto::events::{RpcPairData, UpdateEvents, rpc_pair_data, update_events};
@@ -378,9 +379,9 @@ impl Client {
         let Some(dec) = &msg.decrypted else { return };
         let ev = match UpdateEvents::decode(dec.as_slice()) { Ok(e) => e, Err(e) => { tracing::warn!("UpdateEvents decode: {e}"); return; } };
         match ev.event {
-            Some(update_events::Event::ConversationEvent(c)) => { if !msg.is_old { for conv in c.data { self.emit(Event::Conversation(conv)); } } }
+            Some(update_events::Event::ConversationEvent(c)) => { if !msg.is_old { for mut conv in c.data { ids::conversation(&mut conv); self.emit(Event::Conversation(conv)); } } }
             Some(update_events::Event::MessageEvent(m)) => {
-                for part in m.data { self.resolve_full_size(&part); self.emit(Event::Message { msg: part, is_old: msg.is_old }); }
+                for mut part in m.data { ids::message(&mut part); self.resolve_full_size(&part); self.emit(Event::Message { msg: part, is_old: msg.is_old }); }
             }
             Some(update_events::Event::TypingEvent(t)) => { if !msg.is_old { if let Some(d) = t.data { self.emit(Event::Typing(d)); } } }
             Some(update_events::Event::UserAlertEvent(a)) => {
@@ -539,13 +540,19 @@ impl Client {
         let mt = if self.conversations_fetched.swap(true, Ordering::SeqCst) { MessageType::BugleMessage } else { MessageType::BugleAnnotation };
         let req = ListConversationsRequest { count, folder: folder as i32, cursor: None };
         let inc = self.send_rpc(ActionType::ListConversations, Some(req), SendOpts { message_type: mt, ..Default::default() }).await?.ok_or_else(|| anyhow!("no response"))?;
-        inc.decode()
+        let mut r: ListConversationsResponse = inc.decode()?;
+        r.conversations.iter_mut().for_each(ids::conversation);
+        Ok(r)
     }
     pub async fn get_conversation(&self, id: &str) -> Result<Option<conversations::Conversation>> {
-        Ok(self.call::<_, GetConversationResponse>(ActionType::GetConversation, GetConversationRequest { conversation_id: id.into() }, false).await?.conversation)
+        let mut c = self.call::<_, GetConversationResponse>(ActionType::GetConversation, GetConversationRequest { conversation_id: id.into() }, false).await?.conversation;
+        c.iter_mut().for_each(ids::conversation);
+        Ok(c)
     }
     pub async fn list_messages(&self, conversation_id: &str, count: i64, cursor: Option<Cursor>) -> Result<ListMessagesResponse> {
-        self.call(ActionType::ListMessages, ListMessagesRequest { conversation_id: conversation_id.into(), count, cursor }, false).await
+        let mut r: ListMessagesResponse = self.call(ActionType::ListMessages, ListMessagesRequest { conversation_id: conversation_id.into(), count, cursor }, false).await?;
+        r.messages.iter_mut().for_each(ids::message);
+        Ok(r)
     }
     pub async fn send_text(&self, conversation_id: &str, participant_id: &str, text: &str, sim: Option<settings::SimPayload>) -> Result<()> {
         let tmp = uuid::Uuid::new_v4().to_string();
@@ -596,7 +603,9 @@ impl Client {
     }
     pub async fn get_or_create_conversation(&self, numbers: &[String]) -> Result<GetOrCreateConversationResponse> {
         let req = GetOrCreateConversationRequest { numbers: numbers.iter().map(|n| conversations::ContactNumber { mysterious_int: 2, number: n.clone(), number2: n.clone(), ..Default::default() }).collect(), ..Default::default() };
-        self.call(ActionType::GetOrCreateConversation, req, true).await
+        let mut r: GetOrCreateConversationResponse = self.call(ActionType::GetOrCreateConversation, req, true).await?;
+        r.conversation.iter_mut().for_each(ids::conversation);
+        Ok(r)
     }
     // ───────────────────────────── media ─────────────────────────────
 
