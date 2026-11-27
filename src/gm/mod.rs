@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod events;
 pub mod gaia;
 pub mod http;
+pub mod ids;
 pub mod pblite;
 pub mod proto;
 pub mod session;
