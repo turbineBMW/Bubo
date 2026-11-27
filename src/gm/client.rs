@@ -38,7 +38,16 @@ pub struct Client {
     /// True while a ReceiveMessages stream is open; `stream_opened` wakes waiters on each (re)open.
     stream_open: AtomicBool,
     pub(crate) stream_opened: tokio::sync::Notify,
+    /// The phone stopped pushing to this session (another client took over, or it timed us out).
+    /// Cleared when it tells us we're the active browser again.
+    inactive: AtomicBool,
+    /// A reclaim of the active session is in progress (see `reclaim_active_session`).
+    reclaiming: AtomicBool,
+    /// `full_size_image` calls waiting for the phone's upload, keyed by the media part's action id.
+    full_size_waiters: Mutex<FullSizeWaiters>,
 }
+
+type FullSizeWaiters = std::collections::HashMap<String, Vec<tokio::sync::oneshot::Sender<(String, Vec<u8>)>>>;
 
 pub struct SendOpts {
     pub request_id: Option<String>,
@@ -63,6 +72,7 @@ impl Client {
             auth: Mutex::new(auth), http, lp_http,
             session: Session::default(), events: tx, listen_id: AtomicU64::new(0), skip_count: AtomicI64::new(0),
             conversations_fetched: AtomicBool::new(false), refresh_lock: AsyncMutex::new(()), me: me.clone(), stream_open: AtomicBool::new(false), stream_opened: tokio::sync::Notify::new(),
+            inactive: AtomicBool::new(false), reclaiming: AtomicBool::new(false), full_size_waiters: Mutex::default(),
         });
         c.session.reset_session_id();
         Ok((c, rx))
@@ -369,9 +379,17 @@ impl Client {
         let ev = match UpdateEvents::decode(dec.as_slice()) { Ok(e) => e, Err(e) => { tracing::warn!("UpdateEvents decode: {e}"); return; } };
         match ev.event {
             Some(update_events::Event::ConversationEvent(c)) => { if !msg.is_old { for conv in c.data { self.emit(Event::Conversation(conv)); } } }
-            Some(update_events::Event::MessageEvent(m)) => { for part in m.data { self.emit(Event::Message { msg: part, is_old: msg.is_old }); } }
+            Some(update_events::Event::MessageEvent(m)) => {
+                for part in m.data { self.resolve_full_size(&part); self.emit(Event::Message { msg: part, is_old: msg.is_old }); }
+            }
             Some(update_events::Event::TypingEvent(t)) => { if !msg.is_old { if let Some(d) = t.data { self.emit(Event::Typing(d)); } } }
-            Some(update_events::Event::UserAlertEvent(a)) => { if !msg.is_old { self.emit(Event::Alert(crate::gm::proto::events::AlertType::try_from(a.alert_type).unwrap_or_default())); } }
+            Some(update_events::Event::UserAlertEvent(a)) => {
+                if !msg.is_old {
+                    let t = crate::gm::proto::events::AlertType::try_from(a.alert_type).unwrap_or_default();
+                    self.on_alert(t);
+                    self.emit(Event::Alert(t));
+                }
+            }
             Some(update_events::Event::SettingsEvent(s)) => self.emit(Event::Settings(s)),
             Some(update_events::Event::BrowserPresenceCheckEvent(_)) => {
                 let me = self.as_arc();
@@ -380,6 +398,41 @@ impl Client {
             Some(update_events::Event::AccountChange(a)) => tracing::info!(?a, "account change"),
             None => tracing::debug!("empty UpdateEvents"),
         }
+    }
+
+    /// Track whether the phone is still pushing to us. When it drops this session for being idle
+    /// or timed out, take it back: nothing else wants it, and otherwise new messages silently stop
+    /// arriving until a restart. When another client took over (the plain BROWSER_INACTIVE), leave
+    /// it be — fighting over the session would starve both — and let the UI offer "Use here".
+    fn on_alert(&self, t: crate::gm::proto::events::AlertType) {
+        use crate::gm::proto::events::AlertType as A;
+        match t {
+            A::BrowserActive => {
+                if self.inactive.swap(false, Ordering::SeqCst) { tracing::info!("this session is active again"); }
+            }
+            A::BrowserInactive => { tracing::info!("phone moved to another browser session"); self.inactive.store(true, Ordering::SeqCst); }
+            A::BrowserInactiveFromTimeout | A::BrowserInactiveFromInactivity => {
+                tracing::info!(alert = ?t, "phone dropped this session; reclaiming");
+                self.inactive.store(true, Ordering::SeqCst);
+                let me = self.as_arc();
+                tokio::spawn(async move { me.reclaim_active_session().await; });
+            }
+            _ => {}
+        }
+    }
+
+    /// Make this the session the phone pushes to, retrying with backoff until the phone confirms
+    /// with BROWSER_ACTIVE. Runs after a timeout/inactivity drop or an explicit "Use here".
+    pub async fn reclaim_active_session(self: Arc<Self>) {
+        if self.reclaiming.swap(true, Ordering::SeqCst) { return; }
+        let my_id = self.listen_id.load(Ordering::SeqCst);
+        for delay in [1u64, 5, 15, 30, 60, 120] {
+            if self.listen_id.load(Ordering::SeqCst) != my_id { break; }
+            if let Err(e) = self.set_active_session().await { tracing::warn!("reclaim active session: {e:#}"); }
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            if !self.inactive.load(Ordering::SeqCst) { break; }
+        }
+        self.reclaiming.store(false, Ordering::SeqCst);
     }
 
     fn as_arc(&self) -> Arc<Self> { self.me.upgrade().expect("client dropped") }
@@ -547,6 +600,43 @@ impl Client {
     }
     // ───────────────────────────── media ─────────────────────────────
 
+    /// The phone sends images as a thumbnail only; the original exists just on the phone until
+    /// something asks for it. Ask for it (`action_id` is the media part's `MessageInfo` action
+    /// id) and wait for the phone to upload it. Returns the full image's (media id, key).
+    pub async fn full_size_image(&self, message_id: &str, action_id: &str) -> Result<(String, Vec<u8>)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Several opens of the same image (viewer closed and reopened) all wait on the one upload.
+        self.full_size_waiters.lock().unwrap().entry(action_id.to_string()).or_default().push(tx);
+        let req = GetFullSizeImageRequest { message_id: message_id.into(), action_message_id: action_id.into() };
+        let r = async {
+            let resp: GetFullSizeImageResponse = self.call(ActionType::GetFullSizeImage, req, false).await?;
+            // Already uploaded (asked before): the reply has the id and no update will follow.
+            if let Some(found) = resp.message.as_ref().and_then(|m| full_size_media(m, action_id)) { return Ok(found); }
+            match tokio::time::timeout(Duration::from_secs(90), rx).await {
+                Ok(Ok(found)) => Ok(found),
+                _ => bail!("the phone did not send the full-size image"),
+            }
+        }.await;
+        // Our receiver is gone now; drop its sender but leave other waiters for this image alone.
+        let mut waiters = self.full_size_waiters.lock().unwrap();
+        if let Some(txs) = waiters.get_mut(action_id) {
+            txs.retain(|t| !t.is_closed());
+            if txs.is_empty() { waiters.remove(action_id); }
+        }
+        r
+    }
+
+    fn resolve_full_size(&self, m: &conversations::Message) {
+        let mut waiters = self.full_size_waiters.lock().unwrap();
+        if waiters.is_empty() { return; }
+        let ready: Vec<String> = waiters.keys().filter(|a| full_size_media(m, a).is_some()).cloned().collect();
+        for a in ready {
+            if let (Some(txs), Some(found)) = (waiters.remove(&a), full_size_media(m, &a)) {
+                for tx in txs { let _ = tx.send(found.clone()); }
+            }
+        }
+    }
+
     /// Download an attachment and decrypt it with its per-message key.
     pub async fn download_media(&self, attachment_id: &str, key: &[u8]) -> Result<Vec<u8>> {
         let (tok, net) = { let a = self.auth.lock().unwrap(); (a.tachyon_token.clone(), a.network()) };
@@ -693,6 +783,14 @@ mod reaction_tests {
         assert_eq!(reaction_data("🦉").unicode, "🦉");
         assert_eq!(reaction_emoji(&conversations::ReactionData { unicode: String::new(), r#type: T::Laugh as i32, custom_emoji: None }), "😂");
     }
+}
+
+/// The (media id, key) of `m`'s media part with this action id, once the phone has uploaded it.
+fn full_size_media(m: &conversations::Message, action_id: &str) -> Option<(String, Vec<u8>)> {
+    m.message_info.iter().filter(|i| i.action_message_id.as_deref() == Some(action_id)).find_map(|i| match &i.data {
+        Some(conversations::message_info::Data::MediaContent(mc)) if !mc.media_id.is_empty() => Some((mc.media_id.clone(), mc.decryption_key.clone())),
+        _ => None,
+    })
 }
 
 /// The phone answers non-success when it won't send a message; make that an error.

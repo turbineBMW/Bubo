@@ -72,6 +72,8 @@ pub struct ChatsView {
     gif_btn: gtk4::Button,
     toast: adw::ToastOverlay,
     banner: adw::Banner,
+    /// The phone is pushing to another session (or dropped ours); new messages aren't reaching us.
+    away: Cell<bool>,
     side_stack: gtk4::Stack,
     content_stack: gtk4::Stack,
     composer: gtk4::Box,
@@ -230,6 +232,9 @@ impl ChatsView {
             .bubo-them { background: alpha(currentColor, 0.08); }
             .bubo-image { border-radius: 16px; }
             .bubo-viewer { background: black; }
+            .bubo-video-poster { background: alpha(currentColor, 0.15); }
+            .bubo-play { padding: 14px; border-radius: 999px; }
+            .bubo-blur { filter: blur(14px); }
             .bubo-entry-frame { border-radius: 18px; border: 1px solid color-mix(in srgb, currentColor var(--border-opacity), transparent); background: alpha(currentColor, 0.05); }
             .bubo-entry-frame:focus-within { border-color: var(--accent-bg-color); }
             .bubo-entry, .bubo-entry text { background: transparent; }
@@ -258,7 +263,7 @@ impl ChatsView {
         ");
         gtk4::style_context_add_provider_for_display(&gtk4::gdk::Display::default().unwrap(), &css, gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION);
 
-        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), scroll_queued: Cell::new(false), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, spelling, emoji_btn, send, attach, gif_btn, toast, banner, side_stack, content_stack, composer,
+        let v = Self { widget, win: win.clone(), client, events, on_session_expired: RefCell::new(None), st: Rc::default(), list, thread, thread_scroll, scroll_target: Cell::new(ScrollTarget::Free), scroll_queued: Cell::new(false), media_cache: Rc::default(), avatars: Rc::default(), thread_title, entry, spelling, emoji_btn, send, attach, gif_btn, toast, banner, away: Cell::new(false), side_stack, content_stack, composer,
             pending_box, pending: RefCell::default(), settings, notifier: crate::notify::Notifier::new(), new_chat, contacts: Rc::default(), spam: spam::Screen::new() };
         v
     }
@@ -368,6 +373,14 @@ impl ChatsView {
             *last.borrow_mut() = std::time::Instant::now();
             if let Some(id) = me.st.borrow().current.clone() { let c = me.client.clone(); crate::rt::spawn(async move { let _ = c.set_typing(&id, true).await; }); }
         });
+        // "Use Here": take the phone back from another Messages session.
+        let me = Rc::downgrade(self);
+        self.banner.connect_button_clicked(move |b| {
+            let Some(me) = me.upgrade() else { return };
+            b.set_title("Reconnecting to your phone…"); b.set_button_label(None);
+            let c = me.client.clone();
+            crate::rt::spawn(async move { c.reclaim_active_session().await; });
+        });
         // initial load + event pump
         self.reload_conversations();
         let me = self.clone();
@@ -402,19 +415,21 @@ impl ChatsView {
                 if self.is_news(&m, is_old) && !self.screen_message(&m) { self.notify(&m, None); }
                 self.push_message(m, is_old);
             }
-            Event::PhoneNotResponding => { self.banner.set_title("Your phone isn't responding — is it online?"); self.banner.set_revealed(true); }
-            Event::PhoneRespondingAgain | Event::Connected => self.banner.set_revealed(false),
-            Event::ListenError(e) => { self.banner.set_title(&format!("Connection trouble: {e}")); self.banner.set_revealed(true); }
-            Event::ListenFatal(e) => { self.banner.set_title(&format!("Disconnected: {e}. Run `bubo unpair` and pair again.")); self.banner.set_revealed(true); }
+            Event::PhoneNotResponding => self.show_banner("Your phone isn't responding — is it online?", None),
+            // While another session holds the phone, its banner (and "Use Here") stays up.
+            Event::PhoneRespondingAgain | Event::Connected => { if !self.away.get() { self.banner.set_revealed(false); } }
+            Event::ListenError(e) => self.show_banner(&format!("Connection trouble: {e}"), None),
+            Event::ListenFatal(e) => self.show_banner(&format!("Disconnected: {e}. Run `bubo unpair` and pair again."), None),
+            Event::Alert(t) => self.on_alert(t),
             Event::SessionExpired => {
-                self.banner.set_title("Google expired this pairing — pick the emoji again to reconnect."); self.banner.set_revealed(true);
+                self.show_banner("Google expired this pairing — pick the emoji again to reconnect.", None);
                 // Take it: the phone answers every poll this way until we disconnect, and
                 // re-entering the teardown would restart a re-pair that is already running.
                 let cb = self.on_session_expired.borrow_mut().take();
                 if let Some(cb) = cb { cb(); }
             }
             Event::Unpaired => {
-                self.banner.set_title("This device was unpaired from the phone."); self.banner.set_revealed(true);
+                self.show_banner("This device was unpaired from the phone.", None);
                 let cb = self.on_session_expired.borrow_mut().take();
                 if let Some(cb) = cb { cb(); }
             }
@@ -587,38 +602,75 @@ impl ChatsView {
         if loaded { self.render_thread(ScrollTarget::Bottom); } else {
             while let Some(r) = self.thread.row_at_index(0) { self.thread.remove(&r); }
             self.content_stack.set_visible_child_name("loading");
-            let c = self.client.clone(); let id2 = id.to_string();
-            let (tx, rx) = async_channel::bounded(1);
-            crate::rt::spawn(async move { let _ = tx.send(c.list_messages(&id2, PAGE, None).await).await; });
-            let me = self.clone(); let id2 = id.to_string();
-            glib::spawn_future_local(async move {
-                match rx.recv().await {
-                    Ok(Ok(r)) => {
-                        let more = (r.messages.len() as i64) >= PAGE;
-                        {
-                            let mut st = me.st.borrow_mut();
-                            // Preserve live messages (and status/reaction updates) received before
-                            // or during the fetch rather than replacing the event cache outright.
-                            let msgs = st.messages.entry(id2.clone()).or_default();
-                            for m in r.messages.iter().map(Msg::from_proto) {
-                                if !msgs.iter().any(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) {
-                                    msgs.push(m);
-                                }
-                            }
-                            msgs.sort_by_key(|m| m.ts);
-                            st.cursors.insert(id2.clone(), r.cursor.filter(|_| more));
-                        }
-                        if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(ScrollTarget::Bottom); }
-                    }
-                    Ok(Err(e)) => {
-                        if me.st.borrow().current.as_deref() == Some(&id2) { me.content_stack.set_visible_child_name("thread"); }
-                        me.toast.add_toast(adw::Toast::new(&format!("Could not load messages: {e:#}")));
-                    }
-                    Err(_) => {}
-                }
-            });
+            self.fetch_history(id);
         }
         self.mark_read(id);
+    }
+
+    /// Fetch the latest page of a conversation and merge it into what we have, then redraw the
+    /// thread if it is still the one on screen.
+    fn fetch_history(self: &Rc<Self>, id: &str) {
+        let c = self.client.clone(); let id2 = id.to_string();
+        let (tx, rx) = async_channel::bounded(1);
+        crate::rt::spawn(async move { let _ = tx.send(c.list_messages(&id2, PAGE, None).await).await; });
+        let me = self.clone(); let id2 = id.to_string();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(r)) => {
+                    let more = (r.messages.len() as i64) >= PAGE;
+                    {
+                        let mut st = me.st.borrow_mut();
+                        // Preserve live messages (and status/reaction updates) received before
+                        // or during the fetch rather than replacing the event cache outright.
+                        let msgs = st.messages.entry(id2.clone()).or_default();
+                        for m in r.messages.iter().map(Msg::from_proto) {
+                            if !msgs.iter().any(|x| x.id == m.id || (!m.tmp_id.is_empty() && x.tmp_id == m.tmp_id)) {
+                                msgs.push(m);
+                            }
+                        }
+                        msgs.sort_by_key(|m| m.ts);
+                        // A refetch of an open thread keeps the cursor of pages already scrolled back to.
+                        st.cursors.entry(id2.clone()).or_insert(r.cursor.filter(|_| more));
+                    }
+                    if me.st.borrow().current.as_deref() == Some(&id2) { me.render_thread(ScrollTarget::Bottom); }
+                }
+                Ok(Err(e)) => {
+                    if me.st.borrow().current.as_deref() == Some(&id2) { me.content_stack.set_visible_child_name("thread"); }
+                    me.toast.add_toast(adw::Toast::new(&format!("Could not load messages: {e:#}")));
+                }
+                Err(_) => {}
+            }
+        });
+    }
+
+    /// Catch up after a stretch when the phone was pushing to another session: whatever arrived
+    /// meanwhile never reached us. Reload the list, refetch the open thread, and make every other
+    /// thread refetch when it's next opened.
+    fn resync(self: &Rc<Self>) {
+        let cur = {
+            let mut st = self.st.borrow_mut();
+            let cur = st.current.clone();
+            st.cursors.retain(|k, _| Some(k) == cur.as_ref());
+            cur
+        };
+        self.reload_conversations();
+        if let Some(id) = cur { self.fetch_history(&id); }
+    }
+
+    fn show_banner(&self, title: &str, button: Option<&str>) {
+        self.banner.set_title(title);
+        self.banner.set_button_label(button);
+        self.banner.set_revealed(true);
+    }
+
+    fn on_alert(self: &Rc<Self>, t: crate::gm::proto::events::AlertType) {
+        use crate::gm::proto::events::AlertType as A;
+        match t {
+            A::BrowserInactive => { self.away.set(true); self.show_banner("Google Messages is open in another window.", Some("Use Here")); }
+            A::BrowserInactiveFromTimeout | A::BrowserInactiveFromInactivity => { self.away.set(true); self.show_banner("Reconnecting to your phone…", None); }
+            A::BrowserActive => { if self.away.replace(false) { self.banner.set_revealed(false); self.resync(); } }
+            _ => {}
+        }
     }
 
     /// Tell the phone the conversation's latest message was seen, and clear its unread badge.
@@ -1511,10 +1563,10 @@ impl ChatsView {
         hdr.append(&av); hdr.append(&name);
         col.append(&hdr);
     }
-    // Images stand alone (no bubble, Android-Messages style); other files sit inside the bubble.
+    // Images and videos stand alone (no bubble, Android-Messages style); other files sit inside the bubble.
     for md in &m.media {
         let w = self.attachment_widget(md);
-        if md.is_image() { w.set_halign(halign); col.append(&w); } else { bubble.append(&w); }
+        if md.is_image() || md.is_video() { w.set_halign(halign); col.append(&w); } else { bubble.append(&w); }
     }
     if !m.text.trim().is_empty() {
         bubble.append(&gtk4::Label::builder().label(&m.text).wrap(true).wrap_mode(gtk4::pango::WrapMode::WordChar).xalign(0.0).selectable(true).max_width_chars(60).build());
@@ -1655,7 +1707,9 @@ impl ChatsView {
 
     /// Fetch the full-resolution image the first time `pic` is within one viewport-height of the
     /// visible area of the thread scroller; then replace the placeholder with it.
-    fn lazy_load_image(self: &Rc<Self>, holder: &gtk4::Box, pic: &gtk4::Picture, att_id: String, key: Vec<u8>) {
+    fn lazy_load_image(self: &Rc<Self>, holder: &gtk4::Box, pic: &gtk4::Picture, md: &Media) {
+        let Some((att_id, key)) = md.source() else { return };
+        let md = md.clone();
         let sw = self.thread_scroll.clone();
         let fired = Rc::new(std::cell::Cell::new(false));
         let (me, holder, pic0) = (self.clone(), holder.clone(), pic.clone());
@@ -1669,13 +1723,13 @@ impl ChatsView {
             let (tx, rx) = async_channel::bounded(1);
             let (c, id, key) = (me.client.clone(), att_id.clone(), key.clone());
             crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
-            let (me, holder, pic, id) = (me.clone(), holder.clone(), pic.clone(), att_id.clone());
+            let (me, holder, pic, id, md) = (me.clone(), holder.clone(), pic.clone(), att_id.clone(), md.clone());
             glib::spawn_future_local(async move {
                 match rx.recv().await {
                     Ok(Ok(bytes)) => {
                         let bytes = Rc::new(bytes);
                         me.media_cache.borrow_mut().insert(id, bytes.clone());
-                        match Self::image_picture(&bytes) {
+                        match me.image_picture(&bytes, Some(&md)) {
                             Ok(full) => { if pic.parent().is_some() { holder.remove(&pic); holder.append(&full); } }
                             Err(e) => tracing::warn!("could not decode image: {e}"),
                         }
@@ -1698,8 +1752,8 @@ impl ChatsView {
 
     /// Bare image, scaled to fit within 360x480 (small thumbnails are scaled up), rounded corners.
     /// GIFs animate: frames are pulled from a PixbufAnimation on a timer for as long as the widget lives.
-    /// Clicking it opens the image fullscreen.
-    fn image_picture(bytes: &[u8]) -> anyhow::Result<gtk4::Picture> {
+    /// Clicking it opens the image fullscreen (see `open_image`).
+    fn image_picture(self: &Rc<Self>, bytes: &[u8], md: Option<&Media>) -> anyhow::Result<gtk4::Picture> {
         let pic = gtk4::Picture::new();
         pic.set_content_fit(gtk4::ContentFit::Fill);
         pic.set_can_shrink(true);
@@ -1707,37 +1761,74 @@ impl ChatsView {
         pic.add_css_class("bubo-image");
         pic.set_cursor_from_name(Some("zoom-in"));
         let click = gtk4::GestureClick::builder().button(gtk4::gdk::BUTTON_PRIMARY).build();
-        let full = glib::Bytes::from(bytes);
-        click.connect_released(move |g, _, _, _| { if let Some(w) = g.widget() { Self::show_fullscreen(&w, &full); } });
+        let (me, shown, md) = (Rc::downgrade(self), glib::Bytes::from(bytes), md.cloned());
+        click.connect_released(move |g, _, _, _| {
+            if let (Some(w), Some(me)) = (g.widget(), me.upgrade()) { me.open_image(&w, shown.clone(), md.clone()); }
+        });
         pic.add_controller(click);
         let fit = |pic: &gtk4::Picture, w: i32, h: i32| {
             let (w, h) = (w.max(1) as f64, h.max(1) as f64);
             let k = (360.0 / w).min(480.0 / h);
             pic.set_size_request((w * k).round() as i32, (h * k).round() as i32);
         };
-        if bytes.starts_with(b"GIF8") {
-            let (w, h) = Self::play_gif(&pic, bytes)?;
-            fit(&pic, w, h);
-        } else {
-            let tex = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(bytes))?;
-            fit(&pic, tex.width(), tex.height());
-            pic.set_paintable(Some(&tex));
-        }
+        let (w, h) = Self::set_picture_bytes(&pic, bytes)?;
+        fit(&pic, w, h);
         Ok(pic)
     }
 
-    /// Show an image fullscreen on black, scaled to fit the screen. A click anywhere or Escape closes it.
-    fn show_fullscreen(from: &gtk4::Widget, bytes: &glib::Bytes) {
-        let pic = gtk4::Picture::builder().content_fit(gtk4::ContentFit::Contain).can_shrink(true).hexpand(true).vexpand(true).build();
-        if bytes.starts_with(b"GIF8") {
-            if let Err(e) = Self::play_gif(&pic, bytes) { tracing::warn!("could not show GIF: {e}"); return; }
-        } else {
-            match gtk4::gdk::Texture::from_bytes(bytes) {
-                Ok(tex) => pic.set_paintable(Some(&tex)),
-                Err(e) => { tracing::warn!("could not show image: {e}"); return; }
+    /// Show `bytes` (a GIF animates) on `pic`; returns the image's size.
+    fn set_picture_bytes(pic: &gtk4::Picture, bytes: &[u8]) -> anyhow::Result<(i32, i32)> {
+        if bytes.starts_with(b"GIF8") { return Self::play_gif(pic, bytes); }
+        let tex = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(bytes))?;
+        pic.set_paintable(Some(&tex));
+        Ok((tex.width(), tex.height()))
+    }
+
+    /// Open an image fullscreen: the best copy at hand at once, then the full-size original in its
+    /// place. The phone sends most pictures as a thumbnail only and uploads the original when
+    /// asked, so for those, ask it first.
+    fn open_image(self: &Rc<Self>, from: &gtk4::Widget, shown: glib::Bytes, md: Option<Media>) {
+        let cached = md.as_ref().filter(|m| !m.id.is_empty()).and_then(|m| self.media_cache.borrow().get(&m.id).cloned());
+        let start = cached.as_ref().map(|b| glib::Bytes::from(b.as_slice())).unwrap_or(shown);
+        let Some((pic, spinner)) = Self::show_fullscreen(from, &start) else { return };
+        let Some(md) = md else { return };
+        let can_request = !md.msg_id.is_empty() && !md.action_id.is_empty();
+        if cached.is_some() || (md.id.is_empty() && !can_request) { return; }
+        spinner.set_visible(true);
+        let (tx, rx) = async_channel::bounded(1);
+        let c = self.client.clone();
+        crate::rt::spawn(async move {
+            let r = async {
+                let (id, key) = if !md.id.is_empty() { (md.id.clone(), md.key.clone()) } else { c.full_size_image(&md.msg_id, &md.action_id).await? };
+                let bytes = c.download_media(&id, &key).await?;
+                anyhow::Ok((id, bytes))
+            }.await;
+            let _ = tx.send(r).await;
+        });
+        let cache = self.media_cache.clone();
+        glib::spawn_future_local(async move {
+            let Ok(r) = rx.recv().await else { return };
+            spinner.set_visible(false);
+            match r {
+                Ok((id, bytes)) => {
+                    if let Err(e) = Self::set_picture_bytes(&pic, &bytes) { tracing::warn!("could not show full-size image: {e}"); return; }
+                    cache.borrow_mut().insert(id, Rc::new(bytes));
+                }
+                Err(e) => tracing::warn!("full-size image: {e:#}"),
             }
-        }
-        let win = gtk4::Window::builder().decorated(false).modal(true).css_classes(["bubo-viewer"]).child(&pic).build();
+        });
+    }
+
+    /// Show an image fullscreen on black, scaled to fit the screen. A click anywhere or Escape
+    /// closes it. Returns the picture, to swap in a better copy, and a spinner to show meanwhile.
+    fn show_fullscreen(from: &gtk4::Widget, bytes: &glib::Bytes) -> Option<(gtk4::Picture, adw::Spinner)> {
+        let pic = gtk4::Picture::builder().content_fit(gtk4::ContentFit::Contain).can_shrink(true).hexpand(true).vexpand(true).build();
+        if let Err(e) = Self::set_picture_bytes(&pic, bytes) { tracing::warn!("could not show image: {e}"); return None; }
+        let spinner = adw::Spinner::builder().width_request(32).height_request(32).halign(gtk4::Align::End).valign(gtk4::Align::Start)
+            .margin_top(16).margin_end(16).visible(false).tooltip_text("Loading full size…").build();
+        let overlay = gtk4::Overlay::builder().child(&pic).build();
+        overlay.add_overlay(&spinner);
+        let win = gtk4::Window::builder().decorated(false).modal(true).css_classes(["bubo-viewer"]).child(&overlay).build();
         if let Some(parent) = from.root().and_downcast::<gtk4::Window>() {
             win.set_transient_for(Some(&parent));
             win.set_application(parent.application().as_ref());
@@ -1756,6 +1847,7 @@ impl ChatsView {
         win.add_controller(keys);
         win.fullscreen();
         win.present();
+        Some((pic, spinner))
     }
 
     /// Show a GIF on `pic` and animate it for as long as the picture lives: frames are pulled from
@@ -1787,24 +1879,153 @@ impl ChatsView {
         Ok((anim.width(), anim.height()))
     }
 
-    /// A clickable attachment: images load inline on click; other files save to ~/Downloads.
+    /// A video: its poster frame with a play button. Clicking downloads the video (once; it is kept
+    /// in the cache directory) and plays it in a viewer window, which survives thread re-renders.
+    fn video_widget(self: &Rc<Self>, md: &Media) -> gtk4::Widget {
+        use gtk4::Align::Center;
+        let pic = gtk4::Picture::builder().content_fit(gtk4::ContentFit::Cover).can_shrink(true).overflow(gtk4::Overflow::Hidden)
+            .css_classes(["bubo-image", "bubo-video-poster"]).width_request(240).height_request(180).build();
+        let play = gtk4::Image::builder().icon_name("media-playback-start-symbolic").pixel_size(32).halign(Center).valign(Center).css_classes(["osd", "bubo-play"]).build();
+        let spinner = adw::Spinner::builder().width_request(32).height_request(32).halign(Center).valign(Center).visible(false).build();
+        let overlay = gtk4::Overlay::builder().child(&pic).tooltip_text(md.label()).build();
+        overlay.add_overlay(&play);
+        overlay.add_overlay(&spinner);
+
+        let poster = |pic: &gtk4::Picture, bytes: &[u8]| {
+            let Ok(tex) = gtk4::gdk::Texture::from_bytes(&glib::Bytes::from(bytes)) else { return };
+            let (w, h) = (tex.width().max(1) as f64, tex.height().max(1) as f64);
+            let k = (360.0 / w).min(480.0 / h);
+            pic.set_size_request((w * k).round() as i32, (h * k).round() as i32);
+            pic.set_paintable(Some(&tex));
+        };
+        if !md.inline.is_empty() {
+            // The inline preview is a ~50px JPEG: blur it rather than show its blocks blown up.
+            poster(&pic, &md.inline);
+            pic.add_css_class("bubo-blur");
+        } else if !md.thumb_id.is_empty() {
+            if let Some(bytes) = self.media_cache.borrow().get(&md.thumb_id).cloned() { poster(&pic, &bytes); } else {
+                let (tx, rx) = async_channel::bounded(1);
+                let (c, id, key) = (self.client.clone(), md.thumb_id.clone(), md.thumb_key.clone());
+                crate::rt::spawn(async move { let _ = tx.send(c.download_media(&id, &key).await).await; });
+                let (cache, id, pic) = (self.media_cache.clone(), md.thumb_id.clone(), pic.clone());
+                glib::spawn_future_local(async move {
+                    match rx.recv().await {
+                        Ok(Ok(bytes)) => { poster(&pic, &bytes); cache.borrow_mut().insert(id, Rc::new(bytes)); }
+                        Ok(Err(e)) => tracing::warn!("video thumbnail download failed: {e:#}"),
+                        Err(_) => {}
+                    }
+                });
+            }
+        }
+
+        let path = video_cache_path(md);
+        let (Some(path), false) = (path, md.id.is_empty()) else {
+            play.set_icon_name(Some("action-unavailable-symbolic"));
+            overlay.set_tooltip_text(Some(&format!("{} (not available)", md.label())));
+            return overlay.upcast();
+        };
+        overlay.set_cursor_from_name(Some("pointer"));
+        let click = gtk4::GestureClick::builder().button(gtk4::gdk::BUTTON_PRIMARY).build();
+        let (me, md, ov) = (self.clone(), md.clone(), overlay.clone());
+        click.connect_released(move |_, _, _, _| {
+            if spinner.is_visible() { return; }
+            if path.exists() { Self::play_video(ov.upcast_ref(), &path, &md); return; }
+            spinner.set_visible(true); play.set_visible(false);
+            let (tx, rx) = async_channel::bounded(1);
+            let (c, id, key, dest) = (me.client.clone(), md.id.clone(), md.key.clone(), path.clone());
+            crate::rt::spawn(async move {
+                let r: anyhow::Result<()> = async {
+                    let bytes = c.download_media(&id, &key).await?;
+                    if let Some(dir) = dest.parent() { tokio::fs::create_dir_all(dir).await?; prune_video_cache(dir).await; }
+                    // Write beside it and rename, so a half-written file is never taken for the video.
+                    let tmp = dest.with_extension("part");
+                    tokio::fs::write(&tmp, &bytes).await?;
+                    tokio::fs::rename(&tmp, &dest).await?;
+                    Ok(())
+                }.await;
+                let _ = tx.send(r).await;
+            });
+            let (me, md, path, spinner, play) = (me.clone(), md.clone(), path.clone(), spinner.clone(), play.clone());
+            glib::spawn_future_local(async move {
+                let Ok(r) = rx.recv().await else { return };
+                spinner.set_visible(false); play.set_visible(true);
+                match r {
+                    // The thread may have re-rendered meanwhile (dropping `ov`), so parent the viewer on the window.
+                    Ok(()) => Self::play_video(me.win.upcast_ref(), &path, &md),
+                    Err(e) => me.toast.add_toast(adw::Toast::new(&format!("Could not download video: {e:#}"))),
+                }
+            });
+        });
+        overlay.add_controller(click);
+        overlay.upcast()
+    }
+
+    /// Play a downloaded video fullscreen on black with the standard media controls. Escape or the
+    /// close button closes it; the save button copies it to ~/Downloads.
+    fn play_video(from: &gtk4::Widget, path: &std::path::Path, md: &Media) {
+        use gtk4::Align;
+        let stream = gtk4::MediaFile::for_file(&gtk4::gio::File::for_path(path));
+        let video = gtk4::Video::builder().media_stream(&stream).autoplay(true).hexpand(true).vexpand(true).build();
+        let overlay = gtk4::Overlay::builder().child(&video).build();
+        let error = gtk4::Label::builder().wrap(true).halign(Align::Center).valign(Align::Center).css_classes(["osd", "bubo-play"]).visible(false).build();
+        overlay.add_overlay(&error);
+        stream.connect_error_notify(move |s| {
+            if let Some(e) = s.error() { error.set_label(&format!("Can't play this video: {}", e.message())); error.set_visible(true); }
+        });
+        let save = gtk4::Button::builder().icon_name("document-save-symbolic").tooltip_text("Save to Downloads").css_classes(["osd", "circular"]).build();
+        let close = gtk4::Button::builder().icon_name("window-close-symbolic").tooltip_text("Close").css_classes(["osd", "circular"]).build();
+        let bar = gtk4::Box::builder().orientation(gtk4::Orientation::Horizontal).spacing(8).halign(Align::End).valign(Align::Start).margin_top(12).margin_end(12).build();
+        bar.append(&save); bar.append(&close);
+        overlay.add_overlay(&bar);
+
+        let win = gtk4::Window::builder().decorated(false).modal(true).css_classes(["bubo-viewer"]).child(&overlay).build();
+        if let Some(parent) = from.root().and_downcast::<gtk4::Window>() {
+            win.set_transient_for(Some(&parent));
+            win.set_application(parent.application().as_ref());
+        }
+        let (src, md) = (path.to_path_buf(), md.clone());
+        save.connect_clicked(move |b| {
+            match std::fs::read(&src).map_err(anyhow::Error::from).and_then(|bytes| save_download(&md, &bytes)) {
+                Ok(p) => { b.set_icon_name("object-select-symbolic"); b.set_tooltip_text(Some(&format!("Saved to {}", p.display()))); b.set_sensitive(false); }
+                Err(e) => { b.set_tooltip_text(Some(&format!("Save failed: {e}"))); }
+            }
+        });
+        let w = win.downgrade();
+        close.connect_clicked(move |_| { if let Some(w) = w.upgrade() { w.close(); } });
+        let keys = gtk4::EventControllerKey::new();
+        let w = win.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gtk4::gdk::Key::Escape { return glib::Propagation::Proceed; }
+            if let Some(w) = w.upgrade() { w.close(); }
+            glib::Propagation::Stop
+        });
+        win.add_controller(keys);
+        win.connect_close_request(move |_| { stream.pause(); glib::Propagation::Proceed });
+        win.fullscreen();
+        win.present();
+    }
+
+    /// A clickable attachment: images load inline on click; videos play in a viewer; other files
+    /// save to ~/Downloads.
     fn attachment_widget(self: &Rc<Self>, md: &Media) -> gtk4::Widget {
+        if md.is_video() { return self.video_widget(md); }
         let icon = if md.is_image() { "🖼" } else { "📎" };
         let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
 
         // Inline bytes (no download needed) — render or offer to save immediately.
         if !md.inline.is_empty() {
             if md.is_image() {
-                if let Ok(pic) = Self::image_picture(&md.inline) {
+                if let Ok(pic) = self.image_picture(&md.inline, Some(md)) {
                     holder.append(&pic);
-                    // Inline bytes are a low-res preview. Show it immediately as a placeholder and
-                    // swap in the full image once the widget scrolls into (or near) the viewport.
-                    if let Some((att_id, key)) = md.source() {
+                    // Inline bytes are a tiny (~50px) preview. Show it blurred as a placeholder and
+                    // swap in the real image once the widget scrolls into (or near) the viewport.
+                    if let Some((att_id, _)) = md.source() {
                         if let Some(bytes) = self.media_cache.borrow().get(&att_id).cloned() {
-                            if let Ok(full) = Self::image_picture(&bytes) { holder.remove(&pic); holder.append(&full); }
+                            if let Ok(full) = self.image_picture(&bytes, Some(md)) { holder.remove(&pic); holder.append(&full); }
                             return holder.upcast();
                         }
-                        self.lazy_load_image(&holder, &pic, att_id, key);
+                        pic.add_css_class("bubo-blur");
+                        self.lazy_load_image(&holder, &pic, md);
                     }
                     return holder.upcast();
                 }
@@ -1830,7 +2051,7 @@ impl ChatsView {
                 match rx.recv().await {
                     Ok(Ok(bytes)) => {
                         if md.is_image() {
-                            match Self::image_picture(&bytes) {
+                            match me.image_picture(&bytes, Some(&md)) {
                                 Ok(pic) => {
                                     holder2.remove(&btn2); holder2.append(&pic);
                                 }
@@ -1881,6 +2102,30 @@ fn find_avatar(w: &gtk4::Widget) -> Option<adw::Avatar> {
         child = c.next_sibling();
     }
     None
+}
+
+/// Where a downloaded video is kept for playback: the cache directory, named by a hash of its
+/// attachment id, keeping the original extension so the file is recognisable.
+fn video_cache_path(md: &Media) -> Option<std::path::PathBuf> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    md.id.hash(&mut h);
+    let ext = md.name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e.len() <= 5 && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .or_else(|| md.mime.strip_prefix("video/").map(|s| s.trim_start_matches("x-").to_string()).filter(|s| s.chars().all(|c| c.is_ascii_alphanumeric())))
+        .unwrap_or_else(|| "mp4".into());
+    let dir = directories::ProjectDirs::from("dev", "turbinebmw", "bubo")?.cache_dir().join("videos");
+    Some(dir.join(format!("{:016x}.{ext}", h.finish())))
+}
+
+/// Drop videos downloaded more than two weeks ago (a later click fetches them again), so the cache doesn't grow without bound.
+async fn prune_video_cache(dir: &std::path::Path) {
+    let Ok(mut rd) = tokio::fs::read_dir(dir).await else { return };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(14 * 24 * 3600);
+    while let Ok(Some(e)) = rd.next_entry().await {
+        let Ok(meta) = e.metadata().await else { continue };
+        if meta.is_file() && meta.modified().map(|t| t < cutoff).unwrap_or(false) { let _ = tokio::fs::remove_file(e.path()).await; }
+    }
 }
 
 fn save_download(md: &Media, bytes: &[u8]) -> anyhow::Result<std::path::PathBuf> {

@@ -94,7 +94,12 @@ pub fn relay_headers(content_type: Option<&str>) -> HeaderMap {
 }
 
 pub fn build_client(long_poll: bool) -> Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10));
+    // Keepalive probes notice a connection that died silently (suspend, Wi-Fi/VPN switch) instead
+    // of leaving the long poll waiting on it until the 30-minute timeout.
+    let mut b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(10))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .tcp_keepalive_interval(std::time::Duration::from_secs(10))
+        .tcp_keepalive_retries(3);
     b = if long_poll { b.timeout(std::time::Duration::from_secs(30 * 60)) } else { b.timeout(std::time::Duration::from_secs(120)) };
     Ok(b.build()?)
 }

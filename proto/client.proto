@@ -346,5 +346,7 @@ message GetFullSizeImageRequest {
 }
 
 message GetFullSizeImageResponse {
-
+    // The message as the phone has it now; its media part carries a mediaID only once the
+    // full-size upload is done, which is usually announced by a later message update instead.
+    conversations.Message message = 1;
 }

@@ -4,8 +4,9 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 # gst-plugins-good provides autoaudiosink; without it WebKit's web process aborts
-# as soon as the Google sign-in page sets up audio. protobuf supplies protoc for build.rs.
-deps=(gtk4 libadwaita webkitgtk-6.0 gtksourceview5 libspelling protobuf gst-plugins-base gst-plugins-good)
+# as soon as the Google sign-in page sets up audio. gst-libav decodes the H.264/H.265 video
+# that phones send, for the video player. protobuf supplies protoc for build.rs.
+deps=(gtk4 libadwaita webkitgtk-6.0 gtksourceview5 libspelling protobuf gst-plugins-base gst-plugins-good gst-libav)
 if command -v pacman >/dev/null; then
   missing=$(pacman -T "${deps[@]}" || true)
   if [ -n "$missing" ]; then
