@@ -43,6 +43,7 @@ impl Msg {
                     id: mc.media_id.clone(), key: mc.decryption_key.clone(),
                     thumb_id: mc.thumbnail_media_id.clone(), thumb_key: mc.thumbnail_decryption_key.clone(),
                     inline: mc.media_data.clone(), name: mc.media_name.clone(), mime: mc.mime_type.clone(),
+                    msg_id: m.message_id.clone(), action_id: i.action_message_id.clone().unwrap_or_default(),
                 }),
                 None => {}
             }
@@ -76,9 +77,14 @@ pub struct Media {
     pub inline: Vec<u8>,
     pub name: String,
     pub mime: String,
+    /// The message this belongs to and the media part's action id: what the phone needs to
+    /// upload the full-size original of an image it sent only as a thumbnail.
+    pub msg_id: String,
+    pub action_id: String,
 }
 impl Media {
     pub fn is_image(&self) -> bool { self.mime.starts_with("image/") }
+    pub fn is_video(&self) -> bool { self.mime.starts_with("video/") }
     pub fn label(&self) -> String { if self.name.is_empty() { self.mime.clone() } else { self.name.clone() } }
     /// The best (attachment_id, key) to download, preferring the full image over the thumbnail.
     pub fn source(&self) -> Option<(String, Vec<u8>)> {
